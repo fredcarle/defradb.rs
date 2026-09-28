@@ -61,7 +61,7 @@ impl Default for IrohEndpointConfig {
 /// Mirrors [`IrohAllowlistConfig`] but keeps the explicit set concurrent so
 /// [`IrohCommand::AllowPeer`](super::command::IrohCommand::AllowPeer) can add
 /// a newly authorized peer while the endpoint is running, without a restart.
-#[expect(clippy::large_enum_variant, reason = "one instance per endpoint")]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum AllowlistState {
     AcceptAll,
     Explicit(HopscotchMap<EndpointId, (), RandomState>),
