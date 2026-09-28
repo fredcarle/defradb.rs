@@ -277,12 +277,13 @@ pub trait DocFetcher: MaybeSendSync {
         false
     }
 
-    /// Count the index entries `params` would visit, stopping at `cap`.
+    /// Estimate the index entries `params` would visit, bounded by `cap`.
     ///
     /// Index selection uses this to prefer the most selective usable index.
-    /// The count ignores limit, offset, cursor, and value filters, so it is an
-    /// upper bound on the scan's matches. `None` means this fetcher cannot
-    /// estimate, and selection falls back to the filter's shape alone.
+    /// The estimate ignores limit, offset, cursor, and value filters. Returning
+    /// `cap` also covers exhausting the probe budget before completing a count;
+    /// it must not make an unfinished scan look cheaper than a completed one.
+    /// `None` means this fetcher cannot estimate, so selection uses shape alone.
     async fn estimate_index_scan(
         &self,
         collection_name: &str,

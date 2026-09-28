@@ -12,16 +12,17 @@ use crate::error::Result;
 use crate::fetcher::DocFetcher;
 use crate::mapper::{Filter, Select};
 
-use super::conditions::can_use_index;
+use super::conditions::select_best_index;
 use super::filter_to_scan::filter_to_index_scan;
 
-/// Most index entries counted per candidate; larger scans all tie at the cap.
+/// Maximum work budget per candidate; exhausted scans tie at this initial cap.
 pub const ESTIMATE_CAP: u64 = 1024;
 
 /// Capped entry counts by index name, for one filter on one collection.
 pub type IndexEstimates = RapidHashMap<String, u64>;
 
-/// Count, up to [`ESTIMATE_CAP`], the entries each usable index would scan for `filter`.
+/// Estimate each usable index's scan with at most [`ESTIMATE_CAP`] work units.
+/// Later caps shrink to the best count plus one, preserving winners and ties.
 ///
 /// Returns an empty map when fewer than two indexes are usable (there is no
 /// choice to inform) or when the fetcher cannot estimate.
@@ -34,21 +35,32 @@ pub async fn estimate_filter_indexes(
     if !fetcher.supports_index_queries() {
         return Ok(estimates);
     }
-    let scans: Vec<_> = collection
+    let mut scans: Vec<_> = collection
         .indexes
         .iter()
-        .filter(|index| can_use_index(filter, index))
         .filter_map(|index| filter_to_index_scan(filter, index, None, &collection.fields, None, 0))
         .collect();
     if scans.len() < 2 {
         return Ok(estimates);
     }
+    // Try the shape winner first (especially unique equality lookups). Once
+    // a small scan is known, competitors only need one more entry to lose.
+    if let Some(best) = select_best_index(filter, &collection.indexes) {
+        if let Some(position) = scans
+            .iter()
+            .position(|params| params.index_name == best.name)
+        {
+            scans.swap(0, position);
+        }
+    }
+    let mut cap = ESTIMATE_CAP;
     for params in scans {
         match fetcher
-            .estimate_index_scan(&collection.name, &params, ESTIMATE_CAP)
+            .estimate_index_scan(&collection.name, &params, cap)
             .await?
         {
             Some(count) => {
+                cap = cap.min(count.saturating_add(1));
                 estimates.insert(params.index_name, count);
             }
             None => return Ok(IndexEstimates::default()),

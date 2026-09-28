@@ -135,3 +135,174 @@ async fn a_range_on_a_selective_field_outranks_equality_on_a_shared_field() {
          hour index must be scanned, not the market index every document shares"
     );
 }
+
+#[tokio::test]
+async fn exclusive_range_estimate_skips_duplicate_boundary_keys() {
+    use query::planner::index_selection::{IndexScanParams, IndexScanType};
+    use query::DocFetcher;
+    use storage::index::Bound;
+    let db = seeded_db().await;
+    let fetcher = LensedAutoCommitFetcher::new(db.clone());
+    let params = IndexScanParams {
+        index_name: "Events_market_ASC".into(),
+        scan_type: IndexScanType::RangeScan {
+            prefix_values: vec![],
+            lower: Bound::Exclusive(NormalValue::String("zcat".into())),
+            upper: Bound::Unbounded,
+            reverse: false,
+        },
+        limit: None,
+        offset: 0,
+        value_filter: None,
+        cursor_seek: None,
+    };
+    let before = db.store().keys_read();
+    let count = fetcher
+        .estimate_index_scan("Events", &params, 1)
+        .await
+        .unwrap();
+    let reads = db.store().keys_read() - before;
+    assert_eq!(count, Some(0));
+    assert!(reads <= 1, "cap=1 read {reads} index keys");
+}
+
+#[tokio::test]
+async fn estimation_skips_vector_indexes() {
+    let db = Arc::new(DB::new(RegolithStore::in_memory().unwrap()).unwrap());
+    let mut version = schema();
+    version.fields.push(FieldDescription::new(
+        "5",
+        "embedding",
+        FieldKind::float64_array(),
+    ));
+    let mut vector = single_field_index(3, "embedding");
+    vector.kind = Some(crate::common::schema::vector_kind());
+    version.indexes.push(vector);
+    let selects = query::query_parse::parse_query(
+        r#"{ Events(filter: {market: {_eq: "zcat"}, embedding: {_any: {_gt: 0.0}}}) { market } }"#,
+    )
+    .unwrap();
+    let selected = query::planner::index_selection::select_best_index(
+        selects[0].filter.as_ref().unwrap(),
+        &version.indexes,
+    )
+    .unwrap();
+    assert_eq!(selected.name, "Events_market_ASC");
+    db.create_collection(version).await.unwrap();
+    let runner = query::QueryRunner::with_provider(
+        LensedAutoCommitFetcher::new(db.clone()),
+        db::DbCollectionProvider::new_arc(db.clone()),
+    );
+    let response = runner.execute(QueryRequest::new(
+        r#"{ Events(filter: {market: {_eq: "zcat"}, embedding: {_any: {_gt: 0.0}}}) { market } }"#,
+    )).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+}
+
+#[tokio::test]
+async fn estimation_work_shrinks_after_a_selective_candidate() {
+    use query::planner::index_selection::{
+        estimate_filter_indexes, select_best_index_with_estimates, ESTIMATE_CAP,
+    };
+    let db = seeded_db().await;
+    let fetcher = LensedAutoCommitFetcher::new(db.clone());
+    let mut collection = schema();
+    // Put the selective equality first so it establishes the competing budget.
+    collection.indexes.reverse();
+    for (filter, max_keys, winner) in [
+        (
+            r#"{market: {_eq: "zcat"}, hour: {_eq: "h007"}}"#,
+            PER_HOUR * 2 + 1,
+            Some("Events_hour_ASC"),
+        ),
+        (
+            r#"{market: {_eq: "zcat"}, hour: {_eq: "missing"}}"#,
+            1,
+            Some("Events_hour_ASC"),
+        ),
+        (r#"{hour: {_eq: "h007"}}"#, 0, None),
+        (
+            r#"{market: {_eq: "zcat"}, hour: {_ge: "h000"}}"#,
+            ESTIMATE_CAP as usize * 2,
+            Some("Events_market_ASC"),
+        ),
+    ] {
+        let selects =
+            query::query_parse::parse_query(&format!("{{ Events(filter: {filter}) {{ hour }} }}"))
+                .unwrap();
+        let filter = selects[0].filter.as_ref().unwrap();
+        let before = db.store().keys_read();
+        let counts = estimate_filter_indexes(&fetcher, &collection, filter)
+            .await
+            .unwrap();
+        let keys = db.store().keys_read() - before;
+        assert!(
+            keys <= max_keys,
+            "estimate read {keys} keys, budget {max_keys}"
+        );
+        if let Some(winner) = winner {
+            assert_eq!(
+                select_best_index_with_estimates(filter, &collection.indexes, &counts)
+                    .unwrap()
+                    .name,
+                winner
+            );
+        } else {
+            assert!(counts.is_empty(), "one candidate needs no estimates");
+        }
+        eprintln!("estimate keys: {keys} (budget {max_keys})");
+    }
+}
+
+#[tokio::test]
+async fn empty_in_probes_share_the_estimation_budget() {
+    use query::planner::index_selection::{IndexScanParams, IndexScanType};
+    use query::DocFetcher;
+    let db = Arc::new(DB::new(CountingStore::new(RegolithStore::in_memory().unwrap())).unwrap());
+    let mut collection = schema();
+    let mut index = single_field_index(3, "seq");
+    index.unique = true;
+    collection.indexes.push(index);
+    db.create_collection(collection).await.unwrap();
+    let fetcher = LensedAutoCommitFetcher::new(db.clone());
+    let mut params = IndexScanParams {
+        index_name: "Events_seq_ASC".into(),
+        scan_type: IndexScanType::InScan {
+            values: (0..2000).map(NormalValue::Int).collect(),
+            suffix_values: vec![],
+        },
+        limit: None,
+        offset: 0,
+        value_filter: None,
+        cursor_seek: None,
+    };
+    for cap in [0, 1, 10] {
+        let before = db.store().point_gets();
+        let count = fetcher
+            .estimate_index_scan("Events", &params, cap)
+            .await
+            .unwrap();
+        let gets = db.store().point_gets() - before;
+        assert_eq!(count, Some(cap));
+        assert!(gets <= cap as usize + 3, "cap={cap} performed {gets} reads");
+    }
+    // The budget must also be shared by nested branches, not reset per branch.
+    params.scan_type = IndexScanType::OrScan {
+        branches: vec![
+            IndexScanType::InScan {
+                values: vec![NormalValue::Int(0), NormalValue::Int(1)],
+                suffix_values: vec![],
+            };
+            1000
+        ],
+    };
+    let before = db.store().point_gets();
+    assert_eq!(
+        fetcher
+            .estimate_index_scan("Events", &params, 10)
+            .await
+            .unwrap(),
+        Some(10)
+    );
+    assert!(db.store().point_gets() - before <= 13);
+}
