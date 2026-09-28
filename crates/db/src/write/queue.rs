@@ -17,8 +17,8 @@ const PRUNE_THRESHOLD: usize = 10_000;
 ///
 /// The merge handler shares the DB's instance of this queue (it already holds an
 /// `Arc<DB>`), so local writes and merges contend on the same per-doc lock.
-/// Different documents proceed in parallel. Mirrors Go DefraDB's per-doc merge
-/// queue, extended to also cover local writes.
+/// Arrival allocation also uses collection guards from this queue. Document
+/// updates that do not allocate arrivals can still proceed independently.
 pub struct DocWriteQueue {
     locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Serializes the guard-ACQUISITION phase of multi-document writers (local
@@ -69,6 +69,15 @@ impl DocWriteQueue {
                 .clone()
         };
         mutex.lock_arc().await
+    }
+
+    /// Serialize arrival allocation before opening a transaction. The `arrival:`
+    /// prefix is disjoint from content-addressed document IDs. Acquire collection
+    /// guards first, then arrival guards in sorted collection-ID order, then any
+    /// document guards. Explicit transactions retain optimistic conflict handling
+    /// and never acquire this guard after opening their snapshot.
+    pub(crate) async fn acquire_arrival(&self, collection_id: &str) -> MutexGuardArc<()> {
+        self.acquire(&format!("arrival:{collection_id}")).await
     }
 
     /// Acquire the multi-document batch gate.

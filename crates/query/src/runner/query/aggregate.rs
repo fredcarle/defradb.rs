@@ -316,6 +316,8 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             doc_ids: None,
             cid: None,
             depth: None,
+            arrival_collection: None,
+            arrival_after: 0,
             show_deleted: false,
             is_encrypted: false,
             exhaustive: false,

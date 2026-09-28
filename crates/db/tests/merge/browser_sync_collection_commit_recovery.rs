@@ -160,7 +160,7 @@ async fn a_push_whose_later_root_is_rejected_keeps_the_earlier_commit_and_recove
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_pushes_leave_every_document_in_the_collection_dag() {
-    const PUSHES: i64 = 16;
+    const PUSHES: i64 = 64;
 
     let browser = branchable_node().await;
     let central = branchable_node().await;

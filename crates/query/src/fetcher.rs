@@ -210,6 +210,16 @@ pub trait DocFetcher: MaybeSendSync {
         value: &str,
     ) -> Result<Vec<Document>>;
 
+    async fn get_document_arrivals(
+        &self,
+        options: &DocumentArrivalOptions,
+    ) -> Result<DocumentArrivalPage> {
+        let _ = options;
+        Err(crate::error::QueryError::execution(
+            "document arrival queries are unsupported",
+        ))
+    }
+
     /// Fetch commits from the _commits system collection.
     ///
     /// This method fetches commit history from the headstore and blockstore.
@@ -493,4 +503,33 @@ mod tests {
 
         assert!(result.is_err(), "expected refusal, got {result:?}");
     }
+}
+
+/// Node-local first materialization order, never a cross-replica creation clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentArrivalOptions {
+    /// Collection name; cursors belong to this collection on this receiving node.
+    pub collection: String,
+    /// Exclusive lower bound. Zero begins history retained since installation.
+    pub after: u64,
+    /// Maximum raw entries examined before document authorization filtering.
+    pub limit: u64,
+    /// Direct lookups, ordered by cursor, for request admission within a transaction.
+    pub doc_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentArrivalPage {
+    /// High-water mark in the same transaction snapshot as the entries, including own writes.
+    pub head: u64,
+    /// Last examined position, including entries omitted by authorization.
+    /// An empty filtered page reaches `head`; it does not imply missing history.
+    pub next: u64,
+    pub entries: Vec<DocumentArrival>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentArrival {
+    pub cursor: u64,
+    pub doc_id: String,
 }
