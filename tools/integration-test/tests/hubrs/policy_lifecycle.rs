@@ -15,7 +15,7 @@ use super::helpers;
 #[serial_test::serial]
 async fn rust_hubrs_policy_lifecycle() {
     let binary = RustNode::from_workspace().binary_path().to_path_buf();
-    RustNode::build().expect("build rust binary");
+    RustNode::build_with_features(&["sourcehub"]).expect("build hub.rs-enabled rust binary");
     let alice = helpers::funded_identity();
 
     let hub = helpers::start_hub_cluster().await;
