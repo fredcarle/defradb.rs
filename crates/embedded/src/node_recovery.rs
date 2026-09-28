@@ -1,4 +1,4 @@
-#[cfg(any(feature = "libp2p", feature = "iroh"))]
+#[cfg(feature = "libp2p")]
 use p2p::topics::DefraTopic;
 
 #[cfg(feature = "libp2p")]
@@ -9,6 +9,13 @@ pub(crate) async fn restore_libp2p_replicators<S: storage::corekv::Store + 'stat
     match peerstore.list_replicators().await {
         Ok(entries) => {
             for (peer_id_str, data) in entries {
+                // Not a replicator: the slot libp2p kept its keypair in before
+                // the shared peer key. It is left in place so the identity
+                // stays recoverable, so decoding it here would warn on every
+                // start about a record that is doing its job.
+                if peer_id_str == crate::node_peer_key::LEGACY_LIBP2P_KEY_ID {
+                    continue;
+                }
                 match p2p::ReplicatorInfo::from_bytes(&data) {
                     Ok(info) => {
                         if let Some(peer_id) = info.peer_id() {
@@ -44,51 +51,11 @@ pub(crate) async fn restore_libp2p_replicators<S: storage::corekv::Store + 'stat
 pub(crate) async fn restore_libp2p_documents<S: storage::corekv::Store + 'static>(
     handle: &p2p::P2PHostHandle,
     peerstore: &storage::stores::Peerstore<S>,
-) -> std::collections::HashSet<String> {
-    let mut restored = std::collections::HashSet::new();
+) -> rapidhash::RapidHashSet<String> {
+    let mut restored = rapidhash::RapidHashSet::default();
     if let Ok(doc_ids) = peerstore.load_documents().await {
         for doc_id in &doc_ids {
             let _ = handle.subscribe(DefraTopic::document(doc_id)).await;
-            restored.insert(doc_id.clone());
-        }
-    }
-    restored
-}
-
-#[cfg(feature = "iroh")]
-pub(crate) async fn restore_iroh_replicators<S, B>(
-    coordinator: &std::sync::Arc<p2p::sync::IrohSyncCoordinator<B>>,
-    peerstore: &storage::stores::Peerstore<S>,
-) where
-    S: storage::corekv::Store + 'static,
-    B: blockstore::Blockstore + 'static,
-{
-    match peerstore.list_replicators().await {
-        Ok(entries) => {
-            for (_peer_id_str, data) in entries {
-                if let Ok(rep_info) = p2p::ReplicatorInfo::from_bytes(&data) {
-                    let peer_id = p2p::transport::PeerId::new(rep_info.peer_id_str().to_string());
-                    let _ = coordinator
-                        .create_replicator_info(&peer_id, rep_info, false)
-                        .await;
-                }
-            }
-        }
-        Err(error) => tracing::warn!(error = %error, "failed to load replicators from storage"),
-    }
-}
-
-#[cfg(feature = "iroh")]
-pub(crate) async fn restore_iroh_documents<S: storage::corekv::Store + 'static>(
-    transport: &p2p::iroh::IrohTransport,
-    peerstore: &storage::stores::Peerstore<S>,
-) -> std::collections::HashSet<String> {
-    use p2p::P2PTransport;
-
-    let mut restored = std::collections::HashSet::new();
-    if let Ok(doc_ids) = peerstore.load_documents().await {
-        for doc_id in &doc_ids {
-            let _ = transport.subscribe(DefraTopic::document(doc_id)).await;
             restored.insert(doc_id.clone());
         }
     }

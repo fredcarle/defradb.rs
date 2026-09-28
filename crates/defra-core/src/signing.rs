@@ -5,10 +5,12 @@
 //! Mirrors the pattern used by encryption.rs for EncryptionConfig.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use kovan_map::HopscotchMap;
+use rapidhash::fast::RandomState;
 use zeroize::Zeroize;
 
 /// Remote signing delegate (e.g. Orbis, Secure Enclave host callbacks).
@@ -46,7 +48,7 @@ pub enum SigningAuthorization {
 /// Key type for signing operations.
 ///
 /// Replaces raw string matching with a type-safe enum. Serializes to/from
-/// lowercase strings ("ed25519", "secp256k1", "secp256r1", "bls") for
+/// lowercase strings ("ed25519", "secp256k1", "secp256r1", "bls_aug_v1") for
 /// backward compatibility with JSON/FFI boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -55,7 +57,8 @@ pub enum SigningKeyType {
     Ed25519,
     Secp256k1,
     Secp256r1,
-    Bls,
+    #[serde(rename = "bls_aug_v1")]
+    BlsAugV1,
 }
 
 impl SigningKeyType {
@@ -68,7 +71,7 @@ impl SigningKeyType {
             SigningKeyType::Ed25519 => "ed25519",
             SigningKeyType::Secp256k1 => "secp256k1",
             SigningKeyType::Secp256r1 => "secp256r1",
-            SigningKeyType::Bls => "bls",
+            SigningKeyType::BlsAugV1 => "bls_aug_v1",
         }
     }
 
@@ -78,7 +81,7 @@ impl SigningKeyType {
             SigningKeyType::Ed25519 => crate::block::SignatureType::EdDSA,
             SigningKeyType::Secp256k1 => crate::block::SignatureType::ES256K,
             SigningKeyType::Secp256r1 => crate::block::SignatureType::ES256,
-            SigningKeyType::Bls => crate::block::SignatureType::BLS,
+            SigningKeyType::BlsAugV1 => crate::block::SignatureType::BLSAugV1,
         }
     }
 }
@@ -89,7 +92,7 @@ impl fmt::Display for SigningKeyType {
             SigningKeyType::Ed25519 => write!(f, "ed25519"),
             SigningKeyType::Secp256k1 => write!(f, "secp256k1"),
             SigningKeyType::Secp256r1 => write!(f, "secp256r1"),
-            SigningKeyType::Bls => write!(f, "bls"),
+            SigningKeyType::BlsAugV1 => write!(f, "bls_aug_v1"),
         }
     }
 }
@@ -102,7 +105,7 @@ impl std::str::FromStr for SigningKeyType {
             "ed25519" => Ok(SigningKeyType::Ed25519),
             "secp256k1" => Ok(SigningKeyType::Secp256k1),
             "secp256r1" => Ok(SigningKeyType::Secp256r1),
-            "bls" => Ok(SigningKeyType::Bls),
+            "bls_aug_v1" => Ok(SigningKeyType::BlsAugV1),
             other => Err(format!("unsupported signing key type: {other}")),
         }
     }
@@ -215,26 +218,21 @@ pub fn get_signing_config() -> Option<SigningConfig> {
 /// Global identity store mapping DID → SigningConfig.
 /// When create_identity() generates a keypair, we store it here so that
 /// exec_request() can look up the signing key from just a DID string.
-static IDENTITY_STORE: std::sync::OnceLock<Mutex<HashMap<String, SigningConfig>>> =
+static IDENTITY_STORE: std::sync::OnceLock<HopscotchMap<String, SigningConfig, RandomState>> =
     std::sync::OnceLock::new();
 
-fn identity_store() -> &'static Mutex<HashMap<String, SigningConfig>> {
-    IDENTITY_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+fn identity_store() -> &'static HopscotchMap<String, SigningConfig, RandomState> {
+    IDENTITY_STORE.get_or_init(|| HopscotchMap::with_hasher(RandomState::default()))
 }
 
 /// Store a signing config for a DID.
 pub fn store_identity(did: &str, config: SigningConfig) {
-    if let Ok(mut store) = identity_store().lock() {
-        store.insert(did.to_string(), config);
-    }
+    identity_store().insert(did.to_string(), config);
 }
 
 /// Retrieve stored signing config for a DID.
 pub fn get_identity(did: &str) -> Option<SigningConfig> {
-    identity_store()
-        .lock()
-        .ok()
-        .and_then(|store| store.get(did).cloned())
+    identity_store().get(did)
 }
 
 /// Find a registered DID backed by a remote signer.
@@ -244,11 +242,9 @@ pub fn get_identity(did: &str) -> Option<SigningConfig> {
 /// should fall back to the remote signer identity rather than a local `--identity`
 /// secp256k1 key, so create mutations still go through the signing gate.
 pub fn find_remote_signer_did() -> Option<String> {
-    identity_store().lock().ok().and_then(|store| {
-        store
-            .iter()
-            .find_map(|(did, config)| config.has_remote_signer().then(|| did.clone()))
-    })
+    identity_store()
+        .iter()
+        .find_map(|(did, config)| config.has_remote_signer().then_some(did))
 }
 
 /// Resolve signing config for a request identity when signing is enabled.
@@ -300,9 +296,7 @@ pub fn resolve_signing_config_with_flag(
 
 /// Clear all stored identities (for node cleanup).
 pub fn clear_identity_store() {
-    if let Ok(mut store) = identity_store().lock() {
-        drop(std::mem::take(&mut *store));
-    }
+    identity_store().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -316,38 +310,35 @@ use std::sync::OnceLock;
 /// `thread_local!` doesn't work here because tokio can migrate async tasks
 /// between OS threads at `.await` points. A global map keyed by DID ensures
 /// the token is available regardless of which thread reads it.
-fn request_token_store() -> &'static Mutex<HashMap<String, String>> {
-    static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+fn request_token_store() -> &'static HopscotchMap<String, String, RandomState> {
+    static STORE: OnceLock<HopscotchMap<String, String, RandomState>> = OnceLock::new();
+    STORE.get_or_init(|| HopscotchMap::with_hasher(RandomState::default()))
 }
 
 /// Store the raw JWT from the HTTP Authorization header, keyed by the caller's DID.
 ///
 /// When a user authenticates via JWT, the node doesn't have their private key
 /// and can't create new bearer tokens for them. Instead, we pass through the
-/// original JWT — which IS signed by the user's key — to hub.rs/SourceHub
+/// original JWT (which IS signed by the user's key) to hub.rs/Vera
 /// for ACP operations like register_object.
 pub fn set_request_bearer_token(did: &str, token: impl Into<String>) {
-    if let Ok(mut store) = request_token_store().lock() {
-        store.insert(did.to_string(), token.into());
-    }
+    request_token_store().insert(did.to_string(), token.into());
 }
 
 /// Get the stored request bearer token for a specific DID.
 pub fn get_request_bearer_token(did: &str) -> Option<String> {
-    request_token_store().lock().ok()?.get(did).cloned()
+    request_token_store().get(did)
 }
 
 /// Remove the stored request bearer token for a specific DID.
 pub fn clear_request_bearer_token(did: &str) {
-    if let Ok(mut store) = request_token_store().lock() {
-        store.remove(did);
-    }
+    request_token_store().remove(did);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     fn make_config(label: &str) -> SigningConfig {
         SigningConfig {
@@ -424,7 +415,7 @@ mod tests {
         store_identity(
             "did:key:remote",
             SigningConfig {
-                key_type: SigningKeyType::Bls,
+                key_type: SigningKeyType::BlsAugV1,
                 private_key_bytes: vec![],
                 public_key_bytes: vec![],
                 public_key_hex: "remote".to_string(),

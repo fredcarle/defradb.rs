@@ -289,15 +289,18 @@ impl<S: Store> crate::database::DB<S> {
             txn.commit().await?;
 
             // Update cache
-            let mut cache = self.collections.write().map_err(|e| {
-                tracing::error!(error = ?e, "Collection cache lock poisoned during in-place update");
-                Error::CacheUpdateFailedAfterCommit(actual_name.clone())
-            })?;
-            if new_schema.is_active {
-                cache.insert(actual_name.clone(), Collection::new(new_schema.clone()));
-            } else {
-                cache.remove(&actual_name);
-            }
+            let cached_collection = self
+                .collection_with_index_actions(new_schema.clone())
+                .await?;
+            self.collections.rcu(|old| {
+                let mut cache = old.clone();
+                if new_schema.is_active {
+                    cache.put_named(actual_name.as_str(), cached_collection.clone());
+                } else {
+                    cache.remove(actual_name.as_str());
+                }
+                cache
+            });
 
             tracing::info!(
                 collection = %actual_name,

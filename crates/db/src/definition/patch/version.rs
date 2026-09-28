@@ -12,7 +12,7 @@ impl<S: Store> crate::database::DB<S> {
         old_schema: &CollectionVersion,
         collection_priority: u64,
         collection_heads: &[cid::Cid],
-        collection_id_map: &std::collections::HashMap<String, String>,
+        collection_id_map: &rapidhash::RapidHashMap<String, String>,
     ) -> (String, Option<Vec<u8>>, Option<cid::Cid>) {
         use cid::Cid;
         use sha2::{Digest, Sha256};
@@ -32,7 +32,7 @@ impl<S: Store> crate::database::DB<S> {
         }
 
         // Build set of old field names for detecting which fields are new
-        let old_field_names: std::collections::HashSet<&str> = old_schema
+        let old_field_names: rapidhash::RapidHashSet<&str> = old_schema
             .fields
             .iter()
             .filter(|f| !f.id.is_empty())
@@ -73,10 +73,11 @@ impl<S: Store> crate::database::DB<S> {
         };
 
         // Generate CIDs only for NEW fields with priority=1 (matching Go's empty headstore)
+        let governed = schema.governance_root.is_some();
         let mut field_cids: Vec<Cid> = Vec::new();
         for &idx in &new_field_indices {
             let field = &schema.fields[idx];
-            match schema::generate_field_cid_with_priority(field, 1) {
+            match schema::generate_field_cid_with_priority(field, 1, governed) {
                 Ok(cid) => {
                     schema.fields[idx].id = cid.to_string();
                     field_cids.push(cid);
@@ -118,6 +119,7 @@ impl<S: Store> crate::database::DB<S> {
             collection_heads,
             query_select.as_deref(),
             query_transform.as_ref(),
+            schema::Commitments::of(&*schema),
         ) {
             Ok(cid) => cid.to_string(),
             Err(_) => {

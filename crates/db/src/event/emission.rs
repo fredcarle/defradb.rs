@@ -12,6 +12,7 @@ use std::sync::Arc;
 use storage::corekv::Store;
 
 use crate::error::Result;
+use crate::merge::governance::LocalCommitRelease;
 use crate::txn::DbTxn;
 
 /// Per-mutation broadcast payload, mirroring Go's sendUpdate call.
@@ -37,8 +38,9 @@ pub struct TxnBroadcastEvent {
 /// Without a `TxnBroadcaster`, transactional writes commit locally
 /// and publish to the local bus only — P2P peers never see them.
 /// Mirrors Go's `db.sendUpdate` at `internal/db/p2p.go:23-25`.
-#[async_trait]
-pub trait TxnBroadcaster: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait TxnBroadcaster: defra_core::thread_bounds::MaybeSendSync {
     async fn broadcast_update(&self, event: TxnBroadcastEvent);
 }
 
@@ -56,6 +58,7 @@ pub(crate) fn register_update_event_callback<S: Store + 'static>(
     txn: &mut DbTxn<S>,
     bus: Option<&Arc<dyn Bus>>,
     broadcaster: Option<&Arc<dyn TxnBroadcaster>>,
+    release: Option<&Arc<dyn LocalCommitRelease>>,
     collection_name: String,
     collection_id: String,
     doc_id: String,
@@ -65,11 +68,12 @@ pub(crate) fn register_update_event_callback<S: Store + 'static>(
     collection_block: Option<(Cid, Bytes)>,
     creator_did: Option<String>,
 ) -> Result<()> {
-    if bus.is_none() && broadcaster.is_none() {
+    if bus.is_none() && broadcaster.is_none() && release.is_none() {
         return Ok(());
     }
     let bus = bus.map(Arc::clone);
     let broadcaster = broadcaster.map(Arc::clone);
+    let release = release.map(Arc::clone);
     txn.on_success_async(Box::new(move || {
         Box::pin(async move {
             if let Some(bus) = bus {
@@ -96,6 +100,10 @@ pub(crate) fn register_update_event_callback<S: Store + 'static>(
                     );
                     bus.publish(Message::update(collection_update));
                 }
+            }
+
+            if let Some(release) = release {
+                release.committed(doc_cid, doc_block.clone());
             }
 
             if let Some(broadcaster) = broadcaster {

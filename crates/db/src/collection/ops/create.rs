@@ -1,4 +1,5 @@
 use super::*;
+use rapidhash::HashMapExt;
 
 impl<S: Store> crate::database::DB<S> {
     /// Create a collection within an existing transaction.
@@ -61,9 +62,12 @@ impl<S: Store> crate::database::DB<S> {
                     a.name.cmp(&b.name)
                 }
             });
+            let commitments = schema::Commitments::of(&schema);
             let mut fld_cids = Vec::new();
             for field in &sorted {
-                if let Ok(cid) = schema::generate_field_cid_with_priority(field, 1) {
+                if let Ok(cid) =
+                    schema::generate_field_cid_with_priority(field, 1, commitments.is_governed())
+                {
                     fld_cids.push(cid);
                 }
             }
@@ -75,6 +79,7 @@ impl<S: Store> crate::database::DB<S> {
                 &[],
                 qs_bytes.as_deref(),
                 qt_cid.as_ref(),
+                commitments,
             ) {
                 let new_version_id = new_cid.to_string();
                 let old_version_id = schema.version_id.clone();
@@ -166,10 +171,16 @@ impl<S: Store> crate::database::DB<S> {
             }
         });
 
+        let commitments = schema::Commitments::of(&schema);
         let mut field_cids = Vec::with_capacity(sorted_fields.len());
         for field in &sorted_fields {
             // Generate field block with priority=1 (matches Go)
-            match schema::generate_field_block_with_priority_and_heads(field, 1, &[]) {
+            match schema::generate_field_block_with_priority_and_heads(
+                field,
+                1,
+                &[],
+                commitments.is_governed(),
+            ) {
                 Ok(block_with_cid) => {
                     blockstore
                         .set(&block_with_cid.cid.to_bytes(), &block_with_cid.bytes)
@@ -207,6 +218,7 @@ impl<S: Store> crate::database::DB<S> {
             &[], // no heads for new collections
             qs_bytes_for_block.as_deref(),
             qt_cid_for_block.as_ref(),
+            commitments,
         ) {
             Ok(block_with_cid) => {
                 blockstore
@@ -239,9 +251,7 @@ impl<S: Store> crate::database::DB<S> {
 
         // Update schema_heads: new collection starts at height=1
         if let Ok(cid) = cid::Cid::try_from(version_id.as_str()) {
-            if let Ok(mut heads) = self.schema_heads.write() {
-                heads.insert(name.clone(), (vec![cid], 1));
-            }
+            self.schema_heads.insert(name.clone(), (vec![cid], 1));
         }
 
         // Add to transaction's cache
@@ -299,7 +309,6 @@ impl<S: Store> crate::database::DB<S> {
         )
         .map_err(Error::Other)?;
 
-        let name = schema.name.clone();
         let mut txn = self.new_txn(false).await?;
 
         let finalized_schema = self.create_collection_with_txn(&mut txn, schema).await?;
@@ -316,11 +325,14 @@ impl<S: Store> crate::database::DB<S> {
         self.unforbid_collection_id(finalized_schema.collection_id.as_str())?;
 
         // Update the process-wide cache after successful commit
-        let mut cache = self.collections.write().map_err(|e| {
-            tracing::error!(error = ?e, collection_name = %name, "Collection cache lock poisoned after create");
-            Error::CacheUpdateFailedAfterCommit(name.clone())
-        })?;
-        cache.insert(name, Collection::new(finalized_schema.clone()));
+        let collection = self
+            .collection_with_index_actions(finalized_schema.clone())
+            .await?;
+        self.collections.rcu(|old| {
+            let mut cache = old.clone();
+            cache.put(collection.clone());
+            cache
+        });
 
         Ok(finalized_schema)
     }
@@ -381,8 +393,7 @@ impl<S: Store> crate::database::DB<S> {
         }
 
         // Build old_collection_id -> new_collection_id mapping
-        let mut id_remap: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut id_remap: rapidhash::RapidHashMap<String, String> = rapidhash::RapidHashMap::new();
         for (name, old_id) in &old_ids {
             if let Some(finalized) = finalized_schemas.iter().find(|s| &s.name == name) {
                 if *old_id != finalized.collection_id {
@@ -392,8 +403,8 @@ impl<S: Store> crate::database::DB<S> {
         }
 
         // Also map by name -> new collection_id for Named field kinds
-        let mut name_to_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut name_to_id: rapidhash::RapidHashMap<String, String> =
+            rapidhash::RapidHashMap::new();
         for schema in &finalized_schemas {
             name_to_id.insert(schema.name.clone(), schema.collection_id.clone());
         }
@@ -455,14 +466,17 @@ impl<S: Store> crate::database::DB<S> {
         }
 
         // Update the process-wide cache after successful commit
-        let mut cache = self.collections.write().map_err(|e| {
-            tracing::error!(error = ?e, "Collection cache lock poisoned after atomic create");
-            Error::CacheUpdateFailedAfterCommit("atomic collections".to_string())
-        })?;
-
+        let mut collections = Vec::with_capacity(finalized_schemas.len());
         for schema in &finalized_schemas {
-            cache.insert(schema.name.clone(), Collection::new(schema.clone()));
+            collections.push(self.collection_with_index_actions(schema.clone()).await?);
         }
+        self.collections.rcu(|old| {
+            let mut cache = old.clone();
+            for collection in &collections {
+                cache.put(collection.clone());
+            }
+            cache
+        });
 
         Ok(finalized_schemas)
     }

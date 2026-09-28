@@ -2,6 +2,7 @@
 
 use acp::{DocumentPermission, Identity};
 use identity::Did;
+use rapidhash::RapidHashSet;
 use schema::CollectionVersion;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use crate::document::{documents_to_plan_docs, DocumentMapping};
 use crate::error::{QueryError, Result};
 use crate::executor::GqlWarning;
 use crate::mapper::{Requestable, Select};
+use crate::planner::index_selection::estimate_select;
 use crate::planner::{Doc, Planner};
 use crate::txn::TransactionRegistry;
 
@@ -43,7 +45,7 @@ fn distinct_group_count<'a>(
             .collect::<Vec<_>>()
             .join("\u{1}")
     })
-    .collect::<std::collections::HashSet<_>>()
+    .collect::<RapidHashSet<_>>()
     .len() as i64
 }
 
@@ -69,6 +71,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         // Convert storage documents to values for aggregation
         let mut plan_docs = documents_to_plan_docs(&docs, &mapping)?;
 
+        let app_identity = identity.clone();
         // Apply ACP filtering when the collection is policy-backed.
         if let Some(ref policy) = collection.policy {
             let acp_identity = Identity::from(identity);
@@ -94,6 +97,17 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             }
             plan_docs = filtered;
         }
+        let mut readable = Vec::with_capacity(plan_docs.len());
+        for doc in plan_docs {
+            let doc_id = doc.get(0).and_then(|value| value.as_str()).unwrap_or("");
+            if self
+                .app_may_read(app_identity.as_ref(), collection, doc_id)
+                .await
+            {
+                readable.push(doc);
+            }
+        }
+        plan_docs = readable;
 
         // For each aggregate in the select, compute its value
         // For top-level aggregates, we return a single object with aggregate results
@@ -330,6 +344,10 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         };
 
         // Execute with the planner to get filtered documents
+        let index_estimates = match collections_map.get(&filter_select.collection_name) {
+            Some(collection) => estimate_select(fetcher, collection, &filter_select).await?,
+            None => None,
+        };
         let fetcher_arc = FetcherWrapper::new(fetcher);
         let collections: Vec<CollectionVersion> =
             collections_map.values().map(|c| (**c).clone()).collect();
@@ -337,7 +355,9 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         let mut planner = Planner::new(collections)
             .with_query_limits(self.query_limits)
             .with_fetcher(Arc::new(fetcher_arc))
-            .with_acp(self.acp.clone(), identity);
+            .with_acp(self.acp.clone(), identity)
+            .with_read_validator(self.read_validator.clone())
+            .with_index_estimates(index_estimates);
         if let Some(ref lens_store) = self.lens_store {
             planner = planner.with_lens_store(lens_store.clone());
         }

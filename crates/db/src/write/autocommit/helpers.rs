@@ -41,10 +41,9 @@ pub(crate) async fn write_branchable_collection_block<S: storage::corekv::Store 
     })?;
 
     // The append just superseded the heads it was built on, and the keys it
-    // superseded are reclaimed by a transaction of their own. Every local
-    // branchable mutation funnels through here. The one other append, a merge
-    // authoring the commit for an ingress, reclaims them itself once its
-    // transaction commits, in `merge_handler/composite.rs`.
+    // superseded are reclaimed by a transaction of their own. Every branchable
+    // mutation in the crate funnels through here, so this is the one place
+    // that has to remember.
     //
     // The reclaiming transaction is opened while the caller's is still open,
     // which is sound: transactions are optimistic so neither blocks the other,

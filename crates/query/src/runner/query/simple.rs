@@ -2,16 +2,18 @@
 
 use acp::Identity;
 use identity::Did;
+use rapidhash::{HashSetExt, RapidHashSet};
 use schema::CollectionVersion;
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::document::documents_to_plan_docs;
 use crate::error::Result;
 use crate::mapper::Select;
-use crate::planner::index_selection::{filter_to_index_scan, select_best_index};
+use crate::planner::index_selection::{
+    estimate_select, filter_to_index_scan, select_best_index_with_estimates, IndexEstimates,
+};
 use crate::txn::TransactionRegistry;
 
 use super::super::fetcher::FetcherWrapper;
@@ -41,7 +43,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             ScanSource::Fetcher(Arc::new(FetcherWrapper::new(fetcher)))
         } else if let Some(ref doc_ids) = select.doc_ids {
             // Deduplicate doc_ids while preserving order (Go compatibility)
-            let mut seen = HashSet::new();
+            let mut seen = RapidHashSet::new();
             let unique_ids: Vec<String> = doc_ids
                 .iter()
                 .filter(|id| seen.insert((*id).clone()))
@@ -64,7 +66,13 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         } else if let Some(ref filter) = select.filter {
             // Try to use an index if available
             if fetcher.supports_index_queries() && !collection.indexes.is_empty() {
-                if let Some(best_index) = select_best_index(filter, &collection.indexes) {
+                let estimates = estimate_select(fetcher, collection, select)
+                    .await?
+                    .map(|estimates| estimates.estimates)
+                    .unwrap_or_else(IndexEstimates::default);
+                if let Some(best_index) =
+                    select_best_index_with_estimates(filter, &collection.indexes, &estimates)
+                {
                     // Extract limit/offset for index optimization
                     let limit = select.limit.as_ref().and_then(|l| l.limit);
                     let offset = select.limit.as_ref().map(|l| l.offset).unwrap_or(0);
@@ -107,6 +115,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         };
 
         // Build ACP filter config when the collection is policy-backed.
+        let app_read = self.app_read_check(identity.clone(), collection);
         let acp_filter = collection.policy.as_ref().map(|policy| plan::AcpFilter {
             acp: self.acp.clone(),
             identity: Identity::from(identity),
@@ -121,6 +130,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             mapping.clone(),
             collection,
             acp_filter,
+            app_read,
             self.query_limits,
         )?;
 

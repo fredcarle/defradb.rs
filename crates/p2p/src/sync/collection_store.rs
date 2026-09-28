@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use async_trait::async_trait;
+use defra_core::thread_bounds::MaybeSendSync;
 use std::sync::Arc;
 use storage::corekv::{IterOptions, Key, Reader, Store};
 use storage::keys::systemstore::P2PCollectionKey;
@@ -14,8 +15,9 @@ use storage::stores::Systemstore;
 const COLLECTION_MARKER: u8 = 0xff;
 
 /// Trait for P2P collection storage operations.
-#[async_trait]
-pub trait P2PCollectionStorage: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait P2PCollectionStorage: MaybeSendSync {
     /// Add a collection subscription to persistent storage.
     async fn add_collection(&self, collection_id: &str) -> Result<()>;
 
@@ -49,7 +51,8 @@ impl<S: Store> P2PCollectionStore<S> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<S: Store + 'static> P2PCollectionStorage for P2PCollectionStore<S> {
     async fn add_collection(&self, collection_id: &str) -> Result<()> {
         let key = P2PCollectionKey::new(collection_id);
@@ -184,7 +187,8 @@ fn parse_collection_id(key: &[u8]) -> Option<String> {
 /// No-op implementation for when persistent storage is not available.
 pub struct NoOpCollectionStorage;
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl P2PCollectionStorage for NoOpCollectionStorage {
     async fn add_collection(&self, _collection_id: &str) -> Result<()> {
         Ok(())
@@ -281,7 +285,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<rapidhash::RapidHashSet<_>>();
         assert_eq!(stored, collections.into_iter().collect());
     }
 

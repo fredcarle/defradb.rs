@@ -1,8 +1,8 @@
 use acp::Identity;
 use identity::Did;
+use rapidhash::{HashSetExt, RapidHashMap, RapidHashSet};
 use schema::CollectionVersion;
 use serde_json::{Map, Value as JsonValue};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::document::documents_to_plan_docs;
@@ -10,7 +10,7 @@ use crate::error::{QueryError, Result};
 use crate::mapper::{Requestable, Select};
 use crate::plan::PermissionFilterNode;
 use crate::planner::index_selection::{
-    can_be_ordered_by_index, can_or_filter_use_index, select_best_index,
+    can_be_ordered_by_index, can_or_filter_use_index, estimate_select, select_best_index,
 };
 use crate::planner::Planner;
 use crate::query_parse::{parse_query_with_limits, ExplainType};
@@ -28,7 +28,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         &self,
         query: &str,
         caller_identity: Option<Did>,
-        variables: Option<&std::collections::HashMap<String, JsonValue>>,
+        variables: Option<&RapidHashMap<String, JsonValue>>,
     ) -> Result<JsonValue> {
         let mut selects = parse_query_with_limits(query, variables, self.query_limits)?;
         if query.contains("@exhaustive") {
@@ -256,30 +256,46 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         {
             // Use Planner path for index-based queries, relation aggregates,
             // relation filters/ordering, or similarity
-            let fetcher_arc = FetcherWrapper::new(fetcher);
             let collections_map = self.collections_map().await?;
+            let index_estimates = match collections_map.get(&select.collection_name) {
+                Some(collection) => estimate_select(fetcher, collection, select).await?,
+                None => None,
+            };
+            let fetcher_arc = FetcherWrapper::new(fetcher);
             let collections: Vec<CollectionVersion> =
                 collections_map.values().map(|c| (**c).clone()).collect();
 
             let mut planner = Planner::new(collections)
                 .with_query_limits(self.query_limits)
                 .with_fetcher(Arc::new(fetcher_arc))
-                .with_acp(self.acp.clone(), caller_identity.clone());
+                .with_acp(self.acp.clone(), caller_identity.clone())
+                .with_read_validator(self.read_validator.clone())
+                .with_index_estimates(index_estimates);
             if let Some(ref lens_store) = self.lens_store {
                 planner = planner.with_lens_store(lens_store.clone());
             }
             let plan_result = planner.plan_with_index_info(select)?;
             let mut plan = plan_result.plan;
 
-            // Wrap with permission filter if needed (explain path)
-            if let Some(ref policy) = collection.policy {
-                plan = Box::new(PermissionFilterNode::new(
+            // `plan_with_index_info` wraps a regular collection's root plan in
+            // the permission filter itself; only a view's plan comes back
+            // without one, so wrapping here again would check every document
+            // twice, repeating the ACP lookup and the app read check with its
+            // warnings.
+            if collection.query.is_some() {
+                let app_read = self.app_read_check(caller_identity.clone(), &collection);
+                plan = PermissionFilterNode::wrap(
                     plan,
-                    self.acp.clone(),
-                    Identity::from(caller_identity),
-                    &policy.id,
-                    &policy.resource_name,
-                ));
+                    collection.policy.as_ref().map(|policy| {
+                        (
+                            self.acp.clone(),
+                            Identity::from(caller_identity),
+                            policy.id.clone(),
+                            policy.resource_name.clone(),
+                        )
+                    }),
+                    app_read,
+                );
             }
 
             // Execute the plan and count iterations
@@ -322,7 +338,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
                 plan::ScanSource::Fetcher(Arc::new(FetcherWrapper::new(fetcher)))
             } else if let Some(ref doc_ids) = select.doc_ids {
                 // Deduplicate doc_ids while preserving order (Go compatibility)
-                let mut seen = HashSet::new();
+                let mut seen = RapidHashSet::new();
                 let unique_ids: Vec<String> = doc_ids
                     .iter()
                     .filter(|id| seen.insert((*id).clone()))
@@ -337,6 +353,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             };
 
             // Build ACP filter config if collection has policy and ACP is configured
+            let app_read = self.app_read_check(caller_identity.clone(), &collection);
             let acp_filter = collection.policy.as_ref().map(|policy| plan::AcpFilter {
                 acp: self.acp.clone(),
                 identity: Identity::from(caller_identity),
@@ -351,6 +368,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
                 mapping.clone(),
                 &collection,
                 acp_filter,
+                app_read,
                 self.query_limits,
             )?;
 

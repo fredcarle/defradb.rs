@@ -3,6 +3,7 @@
 use acp::DocumentPermission;
 use chrono::{DateTime, FixedOffset, Utc};
 use identity::Did;
+use rapidhash::RapidHashMap;
 use serde_json::{Map, Value as JsonValue};
 use std::sync::Arc;
 use web_time::Instant;
@@ -84,7 +85,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         &self,
         mutation_str: &str,
         caller_identity: Option<Did>,
-        variables: Option<&std::collections::HashMap<String, JsonValue>>,
+        variables: Option<&RapidHashMap<String, JsonValue>>,
     ) -> Result<JsonValue> {
         let mutator = self.mutator.as_ref().ok_or_else(|| {
             QueryError::execution("mutations require a mutator; call with_mutator() first")
@@ -106,7 +107,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         mutation_str: &str,
         mutator: Arc<dyn DocMutator>,
         caller_identity: Option<Did>,
-        variables: Option<&std::collections::HashMap<String, JsonValue>>,
+        variables: Option<&RapidHashMap<String, JsonValue>>,
         fetcher_override: Option<Arc<dyn crate::fetcher::DocFetcher>>,
     ) -> Result<JsonValue> {
         let mutations = parse_mutations_with_limits(mutation_str, variables, self.query_limits)?;
@@ -329,6 +330,21 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         //
         // This matches Go's behavior where GQL mutations on invisible documents return
         // empty results, while mutations on visible-but-unauthorized documents return errors.
+        if let Some(validator) = &self.write_validator {
+            let request = crate::access_hooks::WriteRequest {
+                identity: caller_identity.as_ref(),
+                collection: &collection,
+                kind: mutation.mutation_type,
+                doc_ids: doc_ids_for_check.as_deref().unwrap_or_default(),
+                create_input: &mutation.create_input,
+                update_input: &mutation.update_input,
+            };
+            validator
+                .validate_write(&request)
+                .await
+                .map_err(QueryError::execution)?;
+        }
+
         let mut acp_filtered_doc_ids: Option<Vec<String>> = None;
         if let Some(ref policy) = collection.policy {
             match mutation.mutation_type {
@@ -986,22 +1002,26 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use document::{DocID, Document};
+    use kovan_queue::seg_queue::SegQueue;
+    use rapidhash::RapidHashSet;
     use schema::{CollectionVersion, FieldDescription, FieldKind};
-    use std::collections::HashSet;
-    use std::sync::Mutex;
 
     use crate::mutator::{CollectionTruncator, CreateResult, DeleteResult, UpdateResult};
     use crate::test_utils::MockFetcher;
     use crate::{QueryExecutor, QueryRequest};
 
     struct CapturingMutator {
-        created_docs: Mutex<Vec<Document>>,
-        broadcast_creators: Mutex<Vec<Option<String>>>,
+        created_docs: SegQueue<Document>,
+        broadcast_creators: SegQueue<Option<String>>,
     }
 
     #[derive(Default)]
     struct CapturingTruncator {
-        calls: Mutex<Vec<(String, bool)>>,
+        calls: SegQueue<(String, bool)>,
+    }
+
+    fn drain<T: 'static>(queue: &SegQueue<T>) -> Vec<T> {
+        std::iter::from_fn(|| queue.pop()).collect()
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -1014,8 +1034,6 @@ mod tests {
             _identity: Option<&Did>,
         ) -> Result<()> {
             self.calls
-                .lock()
-                .unwrap()
                 .push((collection_name.to_string(), filter.is_some()));
             Ok(())
         }
@@ -1024,17 +1042,17 @@ mod tests {
     impl CapturingMutator {
         fn new() -> Self {
             Self {
-                created_docs: Mutex::new(Vec::new()),
-                broadcast_creators: Mutex::new(Vec::new()),
+                created_docs: SegQueue::new(),
+                broadcast_creators: SegQueue::new(),
             }
         }
 
         fn created_docs(&self) -> Vec<Document> {
-            self.created_docs.lock().unwrap().clone()
+            drain(&self.created_docs)
         }
 
         fn broadcast_creators(&self) -> Vec<Option<String>> {
-            self.broadcast_creators.lock().unwrap().clone()
+            drain(&self.broadcast_creators)
         }
     }
 
@@ -1057,7 +1075,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, serde_json::json!({"truncate_User": true}));
-        let calls = truncator.calls.lock().unwrap();
+        let calls = drain(&truncator.calls);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "User");
         assert!(calls[0].1);
@@ -1102,18 +1120,16 @@ mod tests {
     impl crate::mutator::DocMutator for CapturingMutator {
         async fn create(&self, _collection_name: &str, mut doc: Document) -> Result<CreateResult> {
             self.broadcast_creators
-                .lock()
-                .unwrap()
                 .push(defra_core::signing::get_broadcast_creator_did());
             if doc.id().is_none() {
                 // Stand in for the genesis-CID identity a real create would
                 // derive: seed a valid DocID from the capture order.
-                let seq = self.created_docs.lock().unwrap().len();
+                let seq = self.created_docs.len();
                 doc.set_id(document::DocID::new_v0_from_seed(&format!(
                     "test-doc-{seq}"
                 )));
             }
-            self.created_docs.lock().unwrap().push(doc.clone());
+            self.created_docs.push(doc.clone());
             Ok(CreateResult::new(doc.id().unwrap().clone(), doc))
         }
 
@@ -1121,7 +1137,7 @@ mod tests {
             &self,
             _collection_name: &str,
             doc: Document,
-            modified_fields: HashSet<String>,
+            modified_fields: RapidHashSet<String>,
         ) -> Result<UpdateResult> {
             Ok(UpdateResult::new(doc, modified_fields.len()))
         }

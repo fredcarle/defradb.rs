@@ -14,7 +14,7 @@ pub(in crate::planner) use cursor::expand_cursor_plan;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use rapidhash::{HashMapExt, RapidHashMap};
 use std::sync::Arc;
 
 use acp::DocumentACP;
@@ -28,7 +28,7 @@ use crate::fetcher::DocFetcher;
 use crate::limits::QueryLimits;
 use crate::mapper::{Requestable, Select};
 use crate::plan::{IndexScanNode, PermissionFilterNode, SEFilterNode, ScanNode, SelectNode};
-use crate::planner::index_selection::IndexScanParams;
+use crate::planner::index_selection::{IndexScanParams, SelectEstimates};
 use crate::planner::vector_routing;
 use crate::planner::PlanNode;
 
@@ -51,7 +51,7 @@ pub struct PlanResult {
     /// Internal render keys for aggregate relation data when there's a collision
     /// with a relation selection (e.g., both `_count(published: {})` and `published(limit: 2)`).
     /// Maps: aggregate_output_name -> (relation_field_name, internal_key)
-    pub aggregate_internal_keys: HashMap<String, (String, String)>,
+    pub aggregate_internal_keys: RapidHashMap<String, (String, String)>,
     /// Warnings raised while planning, for the response's `extensions` member.
     pub warnings: Vec<GqlWarning>,
 }
@@ -70,10 +70,10 @@ impl PlanResult {
 /// ScanNodes must have their data pre-loaded via `with_docs()`.
 pub struct Planner {
     /// Available collection schemas by name
-    pub(super) collections: HashMap<String, Arc<CollectionVersion>>,
+    pub(super) collections: RapidHashMap<String, Arc<CollectionVersion>>,
     /// Available collection schemas by CollectionID (CID)
     /// This is needed because FieldKind::Relation stores the CollectionID, not the name
-    pub(super) collections_by_id: HashMap<String, Arc<CollectionVersion>>,
+    pub(super) collections_by_id: RapidHashMap<String, Arc<CollectionVersion>>,
     /// Optional fetcher for ScanNodes to load data on-demand
     pub(super) fetcher: Option<Arc<dyn DocFetcher>>,
     /// Optional lens transform store for view queries with transforms
@@ -82,10 +82,14 @@ pub struct Planner {
     acp: Option<Arc<dyn DocumentACP>>,
     /// Identity for ACP permission checks
     identity_did: Option<Did>,
+    /// App read validator, applied after ACP
+    read_validator: Option<Arc<dyn crate::access_hooks::ReadValidator>>,
     /// Pre-computed FTS scores: output_name → (doc_id → score)
-    pub(crate) fts_scores: HashMap<String, HashMap<String, f64>>,
+    pub(crate) fts_scores: RapidHashMap<String, RapidHashMap<String, f64>>,
     /// Query parsing and filter evaluation guardrails.
     pub(crate) query_limits: QueryLimits,
+    /// Pre-computed index entry counts for the root select's filter.
+    pub(crate) index_estimates: Option<SelectEstimates>,
 }
 
 impl Planner {
@@ -99,14 +103,15 @@ impl Planner {
 
     /// Create a new planner with the given collection schemas.
     pub fn new(collections: Vec<CollectionVersion>) -> Self {
-        let collections: HashMap<String, Arc<CollectionVersion>> = collections
+        let collections: RapidHashMap<String, Arc<CollectionVersion>> = collections
             .into_iter()
             .map(|c| (c.name.clone(), Arc::new(c)))
             .collect();
         // Build a second map by CollectionID and VersionID for relation field resolution.
         // FieldKind::Relation stores the schema version CID (version_id), so we need
         // to look up by both collection_id and version_id.
-        let mut collections_by_id: HashMap<String, Arc<CollectionVersion>> = HashMap::new();
+        let mut collections_by_id: RapidHashMap<String, Arc<CollectionVersion>> =
+            RapidHashMap::new();
         for c in collections.values() {
             if !c.collection_id.is_empty() {
                 collections_by_id.insert(c.collection_id.clone(), c.clone());
@@ -122,8 +127,10 @@ impl Planner {
             lens_store: None,
             acp: None,
             identity_did: None,
-            fts_scores: HashMap::new(),
+            read_validator: None,
+            fts_scores: RapidHashMap::new(),
             query_limits: QueryLimits::default(),
+            index_estimates: None,
         }
     }
 
@@ -143,8 +150,17 @@ impl Planner {
     }
 
     /// Set pre-computed FTS scores for BM25 nodes.
-    pub fn with_fts_scores(mut self, scores: HashMap<String, HashMap<String, f64>>) -> Self {
+    pub fn with_fts_scores(
+        mut self,
+        scores: RapidHashMap<String, RapidHashMap<String, f64>>,
+    ) -> Self {
         self.fts_scores = scores;
+        self
+    }
+
+    /// Set pre-computed index entry counts so index selection prefers selective indexes.
+    pub fn with_index_estimates(mut self, estimates: Option<SelectEstimates>) -> Self {
+        self.index_estimates = estimates;
         self
     }
 
@@ -161,23 +177,43 @@ impl Planner {
         self
     }
 
-    /// Conditionally wrap a plan with a PermissionFilterNode if the collection has an ACP policy.
+    pub fn with_read_validator(
+        mut self,
+        validator: Option<Arc<dyn crate::access_hooks::ReadValidator>>,
+    ) -> Self {
+        self.read_validator = validator;
+        self
+    }
+
+    /// Whether an app read validator hides rows of `collection`.
+    pub(super) fn app_gates_reads(&self, collection: &CollectionVersion) -> bool {
+        self.read_validator
+            .as_ref()
+            .is_some_and(|validator| validator.governs(collection))
+    }
+
+    /// Wrap a plan with a PermissionFilterNode when the collection has an ACP
+    /// policy or an app read validator governs it.
     pub(super) fn maybe_wrap_with_acp_filter(
         &self,
         plan: Box<dyn PlanNode>,
         collection: &CollectionVersion,
     ) -> Box<dyn PlanNode> {
-        if let (Some(ref acp), Some(ref policy)) = (&self.acp, &collection.policy) {
-            Box::new(PermissionFilterNode::from_optional_did(
-                plan,
+        let acp = match (&self.acp, &collection.policy) {
+            (Some(acp), Some(policy)) => Some((
                 acp.clone(),
-                self.identity_did.clone(),
-                &policy.id,
-                &policy.resource_name,
-            ))
-        } else {
-            plan
-        }
+                acp::Identity::from(self.identity_did.clone()),
+                policy.id.clone(),
+                policy.resource_name.clone(),
+            )),
+            _ => None,
+        };
+        let app = crate::access_hooks::AppReadCheck::bind(
+            self.read_validator.as_ref(),
+            self.identity_did.clone(),
+            collection,
+        );
+        PermissionFilterNode::wrap(plan, acp, app)
     }
 
     /// Get a collection by name or CollectionID.
@@ -271,7 +307,11 @@ impl Planner {
         // and is therefore always right.
         let rows_rejected_above_the_scan = filter_has_relations
             || is_complex_filter
-            || (self.acp.is_some() && collection.policy.is_some());
+            || select.group_by.is_some()
+            // prepare_filter removes computed aliases before classifying the filter.
+            || select.filter.as_ref().is_some_and(|filter| filter.has_alias_filter())
+            || (self.acp.is_some() && collection.policy.is_some())
+            || self.app_gates_reads(&collection);
 
         let mut warnings: Vec<GqlWarning> = Vec::new();
 

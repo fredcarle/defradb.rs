@@ -12,11 +12,11 @@
 use cid::Cid;
 
 use crate::error::{QueryError, Result};
+use rapidhash::{HashMapExt, HashSetExt, RapidHashMap, RapidHashSet};
 use schema::{
     CType, CollectionVersion, FieldDescription, FieldKind, IndexDescription,
     IndexedFieldDescription, VectorEmbeddingDescription,
 };
-use std::collections::HashMap;
 
 use super::directives::IndexDirection;
 use super::helpers::{
@@ -24,14 +24,14 @@ use super::helpers::{
 };
 use super::parser::{ParsedTypeDef, SdlParser};
 
-type PrimaryDirectiveMap = std::collections::HashMap<(String, String, String), bool>;
+type PrimaryDirectiveMap = RapidHashMap<(String, String, String), bool>;
 
 impl<'a> SdlParser<'a> {
     pub(super) fn collect_primary_directives(
         &self,
-        type_names: &std::collections::HashSet<String>,
+        type_names: &RapidHashSet<String>,
     ) -> PrimaryDirectiveMap {
-        let mut result = std::collections::HashMap::new();
+        let mut result = RapidHashMap::new();
 
         for (type_name, type_def) in &self.type_defs {
             for field in &type_def.fields {
@@ -70,12 +70,12 @@ impl<'a> SdlParser<'a> {
     /// Checks for NonNull fields, one-one relation primary constraints, and default value constraints.
     pub(super) fn build_collections(&self) -> Result<Vec<CollectionVersion>> {
         // Build collection names set for relation detection, including external types
-        let mut type_names: std::collections::HashSet<_> = self.type_defs.keys().cloned().collect();
+        let mut type_names: RapidHashSet<_> = self.type_defs.keys().cloned().collect();
         type_names.extend(self.known_external_types.iter().cloned());
 
         // Pre-validate all field types to accumulate multiple errors (Go compatibility).
         // Go collects ALL "no type found" errors before returning, rather than stopping at first.
-        let scalar_types: std::collections::HashSet<&str> = [
+        let scalar_types: RapidHashSet<&str> = [
             "String", "Int", "Float", "Float64", "Float32", "Boolean", "ID", "DateTime", "JSON",
             "Blob", "Self",
         ]
@@ -128,14 +128,13 @@ impl<'a> SdlParser<'a> {
         // have already been processed and their CollectionIDs are known.
 
         // Build dependency graph: which types does each type's CID depend on?
-        let mut dependencies: std::collections::HashMap<String, std::collections::HashSet<String>> =
-            std::collections::HashMap::new();
+        let mut dependencies: RapidHashMap<String, RapidHashSet<String>> = RapidHashMap::new();
 
         for type_name in &sorted_type_names {
             let type_def = self.type_defs.get(type_name).ok_or_else(|| {
                 QueryError::internal(format!("unknown type in dependency graph: {type_name}"))
             })?;
-            let mut deps = std::collections::HashSet::new();
+            let mut deps = RapidHashSet::new();
 
             for field in &type_def.fields {
                 let target = &field.field_type.base_type;
@@ -182,8 +181,7 @@ impl<'a> SdlParser<'a> {
         // Topological sort using Kahn's algorithm
         // In-degree = number of types this type depends on (not how many depend on it).
         // Types with in-degree 0 have no unresolved dependencies and can be processed.
-        let mut in_degree: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut in_degree: RapidHashMap<String, usize> = RapidHashMap::new();
         for (type_name, deps) in &dependencies {
             in_degree.insert(type_name.clone(), deps.len());
         }
@@ -233,9 +231,11 @@ impl<'a> SdlParser<'a> {
         // Pass 1: Calculate CollectionIDs in topological order
         // This ensures CID dependencies are resolved correctly.
         // Also simulates Go's headstore to replicate prefix collision behavior.
-        let mut all_collection_ids: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut headstore: HashMap<String, (Cid, u64)> = HashMap::new();
+        let mut all_collection_ids: RapidHashMap<String, String> = RapidHashMap::new();
+        // Version IDs are tracked beside them: they equal the collection ID
+        // unless a policy is attached, which reaches the version only.
+        let mut all_version_ids: RapidHashMap<String, String> = RapidHashMap::new();
+        let mut headstore: RapidHashMap<String, (Cid, u64)> = RapidHashMap::new();
 
         for type_name in &processing_order {
             let type_def = self.type_defs.get(type_name).ok_or_else(|| {
@@ -251,6 +251,7 @@ impl<'a> SdlParser<'a> {
             )?;
             // Store this type's CollectionID for later types to reference
             all_collection_ids.insert(type_name.clone(), collection.collection_id.clone());
+            all_version_ids.insert(type_name.clone(), collection.version_id.clone());
 
             // Update simulated headstore: store this collection's CID with height=1
             // (Go stores collection definition CIDs at prefix /g/<CollectionName>)
@@ -268,8 +269,8 @@ impl<'a> SdlParser<'a> {
             }
         }
         // Compute CollectionSetIDs for multi-type circular groups
-        let mut collection_set_map: HashMap<String, schema::CollectionSetDescription> =
-            HashMap::new();
+        let mut collection_set_map: RapidHashMap<String, schema::CollectionSetDescription> =
+            RapidHashMap::new();
         for group in &collection_set_groups {
             if group.len() < 2 {
                 continue;
@@ -324,7 +325,7 @@ impl<'a> SdlParser<'a> {
             // Override with Pass 1's CID (computed in topological order with headstore)
             if let Some(pass1_id) = all_collection_ids.get(type_name) {
                 collection.collection_id = pass1_id.clone();
-                collection.version_id = pass1_id.clone();
+                collection.version_id = all_version_ids.get(type_name).unwrap_or(pass1_id).clone();
             }
 
             // Assign CollectionSetDescription for multi-type circular groups
@@ -346,11 +347,11 @@ impl<'a> SdlParser<'a> {
     pub(super) fn build_collection(
         &self,
         type_def: &ParsedTypeDef,
-        type_names: &std::collections::HashSet<String>,
-        collection_set: &std::collections::HashMap<String, (i32, usize)>,
-        known_collection_ids: &std::collections::HashMap<String, String>,
+        type_names: &RapidHashSet<String>,
+        collection_set: &RapidHashMap<String, (i32, usize)>,
+        known_collection_ids: &RapidHashMap<String, String>,
         primary_directives: &PrimaryDirectiveMap,
-        headstore: &HashMap<String, (Cid, u64)>,
+        headstore: &RapidHashMap<String, (Cid, u64)>,
     ) -> Result<CollectionVersion> {
         // collection_id will be generated after fields are created (like Go)
         let mut fields = Vec::new();
@@ -642,8 +643,7 @@ impl<'a> SdlParser<'a> {
         // Build a set of valid field names for validation.
         // Use the `fields` vector (not type_def.fields) because it includes auto-generated
         // FK fields like `_addressID` that may be referenced in type-level indexes.
-        let valid_field_names: std::collections::HashSet<_> =
-            fields.iter().map(|f| f.name.as_str()).collect();
+        let valid_field_names: RapidHashSet<_> = fields.iter().map(|f| f.name.as_str()).collect();
 
         for composite_idx in &type_def.directives.indexes {
             // Validate that all referenced fields exist
@@ -748,10 +748,39 @@ impl<'a> SdlParser<'a> {
 
         // Generate collection ID from type name and fields (like Go, includes field CIDs as links)
         // The headstore simulates Go's prefix collision behavior for deterministic CIDs
-        let collection_id = generate_collection_id(&type_def.name, &fields, headstore);
+        let commitments = schema::Commitments {
+            governance_root: type_def.directives.governance_root.as_deref(),
+            is_branchable: type_def.directives.is_branchable,
+            // The collection ID never carries the policy: see below.
+            policy_cid: None,
+        };
+        let collection_id = generate_collection_id(&type_def.name, &fields, headstore, commitments);
 
-        // Version ID equals collection ID for new schemas (Go behavior)
-        let version_id = collection_id.clone();
+        // Version ID equals collection ID for new schemas (Go behavior), unless
+        // a governed collection has a policy attached: that reaches the version
+        // and not the collection, so attaching or amending one mints a new
+        // version of the same collection rather than a different collection.
+        // An ungoverned collection commits to no policy at all, and keeps the
+        // version ID it has today.
+        let policy = type_def.directives.policy.as_ref().map(|policy_config| {
+            schema::PolicyDescription::new(&policy_config.id, &policy_config.resource)
+        });
+        let policy_commitment = commitments
+            .is_governed()
+            .then(|| schema::policy_commitment(policy.as_ref()))
+            .flatten();
+        let version_id = match policy_commitment {
+            None => collection_id.clone(),
+            Some(policy_cid) => generate_collection_id(
+                &type_def.name,
+                &fields,
+                headstore,
+                schema::Commitments {
+                    policy_cid: Some(policy_cid),
+                    ..commitments
+                },
+            ),
+        };
 
         // Build encrypted indexes from @encryptedIndex directives
         let encrypted_indexes: Vec<schema::EncryptedIndexDescription> = type_def
@@ -966,12 +995,10 @@ impl<'a> SdlParser<'a> {
         collection.downsample_time_field = type_def.directives.downsample_time_field.clone();
         collection.downsample_retention = type_def.directives.downsample_retention.clone();
         collection.is_branchable = type_def.directives.is_branchable;
-        if let Some(ref policy_config) = type_def.directives.policy {
-            collection.policy = Some(schema::PolicyDescription::new(
-                &policy_config.id,
-                &policy_config.resource,
-            ));
-        }
+        collection
+            .governance_root
+            .clone_from(&type_def.directives.governance_root);
+        collection.policy = policy;
 
         Ok(collection)
     }

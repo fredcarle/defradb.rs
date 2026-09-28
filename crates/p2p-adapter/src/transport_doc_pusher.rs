@@ -8,8 +8,9 @@ use p2p::transport::PeerId;
 use p2p::P2PTransport;
 
 /// Type-erased interface for transport-generic push operations.
-#[async_trait]
-pub trait TransportDocPusher: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait TransportDocPusher: defra_core::thread_bounds::MaybeSendSync {
     async fn push_retry_marker_stats(&self) -> P2PResult<storage::stores::PushRetryMarkerStats> {
         Ok(storage::stores::PushRetryMarkerStats::default())
     }
@@ -133,7 +134,8 @@ impl<S: storage::corekv::Store + 'static, T: P2PTransport> DbTransportDocPusher<
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<S: storage::corekv::Store + 'static, T: P2PTransport> TransportDocPusher
     for DbTransportDocPusher<S, T>
 {

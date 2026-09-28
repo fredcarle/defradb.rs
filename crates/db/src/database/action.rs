@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use kovan_map::HopscotchMap;
+use rapidhash::fast::RandomState;
+use rapidhash::{HashMapExt, RapidHashMap};
 use std::sync::Arc;
 
 use defra_core::{Action, ActionExecution, ActionStatus};
-use parking_lot::Mutex;
 use storage::corekv::{IterOptions, Key, Store};
 use storage::keys::systemstore::{ActionProgressKey, ActionReasonKey, ActionStatusKey};
 
@@ -43,15 +44,22 @@ pub struct ActionKey {
     subject: String,
 }
 
-#[derive(Debug, Default)]
 pub struct ActionRegistry {
-    pub active: Mutex<HashSet<ActionKey>>,
+    pub active: HopscotchMap<ActionKey, (), RandomState>,
+}
+
+impl Default for ActionRegistry {
+    fn default() -> Self {
+        Self {
+            active: HopscotchMap::with_hasher(RandomState::default()),
+        }
+    }
 }
 
 impl ActionRegistry {
     /// True when no process-local action claim is held.
     pub(crate) fn is_empty(&self) -> bool {
-        self.active.lock().is_empty()
+        self.active.is_empty()
     }
 }
 
@@ -78,7 +86,7 @@ impl ActionExecutionLease {
             action,
             subject: subject.to_string(),
         };
-        if !registry.active.lock().insert(key.clone()) {
+        if registry.active.insert_if_absent(key.clone(), ()).is_some() {
             return Err(Error::ActionInProgress {
                 collection_id: collection_id.to_string(),
                 action: action.value(),
@@ -118,7 +126,7 @@ async fn delete_keys(systemstore: &datastore::NamespaceView, keys: &[Vec<u8>]) -
 
 impl Drop for ActionExecutionLease {
     fn drop(&mut self) {
-        self.registry.active.lock().remove(&self.key);
+        self.registry.active.remove(&self.key);
     }
 }
 
@@ -283,7 +291,7 @@ impl<S: Store> crate::database::DB<S> {
     pub async fn list_index_actions(
         &self,
         collection_id: &str,
-    ) -> Result<HashMap<u32, ActionExecution>> {
+    ) -> Result<RapidHashMap<u32, ActionExecution>> {
         self.check_node_access(None, acp::nac::NodePermission::IndexList)
             .await?;
 
@@ -347,7 +355,7 @@ pub(crate) async fn action_executions(
 pub(crate) async fn index_action_statuses(
     systemstore: &datastore::NamespaceView,
     collection_id: &str,
-) -> Result<HashMap<u32, ActionStatus>> {
+) -> Result<RapidHashMap<u32, ActionStatus>> {
     Ok(index_action_executions(systemstore, collection_id)
         .await?
         .into_iter()
@@ -358,7 +366,7 @@ pub(crate) async fn index_action_statuses(
 async fn index_action_executions(
     systemstore: &datastore::NamespaceView,
     collection_id: &str,
-) -> Result<HashMap<u32, ActionExecution>> {
+) -> Result<RapidHashMap<u32, ActionExecution>> {
     let mut iter = systemstore
         .iterator(IterOptions::new().with_prefix(ActionStatusKey::collection_prefix(collection_id)))
         .await
@@ -366,7 +374,7 @@ async fn index_action_executions(
     let pairs = iter.collect_all().await.map_err(Error::Storage)?;
     iter.close().await.map_err(Error::Storage)?;
 
-    let mut executions = HashMap::new();
+    let mut executions = RapidHashMap::new();
     for pair in pairs {
         let Some(key) = ActionStatusKey::parse(&pair.key) else {
             continue;

@@ -6,7 +6,6 @@
 mod authorization;
 mod batch;
 mod collection;
-mod collection_commit;
 pub mod composite;
 mod composite_fields;
 mod composite_heads;
@@ -19,15 +18,19 @@ mod encryption;
 pub(crate) mod error;
 pub mod hook;
 mod lww;
+mod protected_update;
 mod recovery;
 pub mod se_merge;
 mod signature;
+pub(crate) use signature::verify_signature_data;
 
 pub use error::MergeError;
 pub(crate) use error::{CounterMergeResult, LwwMergeResult};
-pub(crate) use signature::verify_signature_data;
 
-use std::collections::{HashMap, HashSet};
+use kovan_map::HopscotchMap;
+use kovan_queue::seg_queue::SegQueue;
+use rapidhash::fast::RandomState;
+use rapidhash::{RapidHashMap, RapidHashSet};
 use std::sync::Arc;
 
 use cid::Cid;
@@ -37,7 +40,7 @@ use datastore::NamespaceView;
 use defra_core::block::{
     Block, CollectionDefinitionDeltaPayload, CrdtDelta, FieldDefinitionDeltaPayload,
 };
-use defra_core::merge::{BlockMetadata, MergeHandler, MergeOutcome};
+use defra_core::merge::{BlockMetadata, MergeErrorDisposition, MergeHandler, MergeOutcome};
 use defra_core::types::DocId;
 use document::{DocID, Document, NormalValue};
 use events::{MergeCompleteData, Message, Update};
@@ -60,6 +63,14 @@ use hook::CompositeMergeHook;
 /// while leaving room for long-lived documents with thousands of updates.
 /// Valid depths are `0..DEFAULT_MAX_MERGE_DEPTH`.
 pub const DEFAULT_MAX_MERGE_DEPTH: usize = 8192;
+
+/// A lock-free set of block CIDs.
+pub type CidSet = HopscotchMap<Cid, (), RandomState>;
+
+/// An empty [`CidSet`].
+pub fn cid_set() -> CidSet {
+    CidSet::with_hasher(RandomState::default())
+}
 
 /// Encode a priority value as a varint (matches Go's binary.PutUvarint).
 pub(crate) fn encode_priority_varint(priority: u64) -> Vec<u8> {
@@ -89,14 +100,19 @@ pub struct DbMergeHandler<S: Store, B: blockstore::Blockstore> {
     /// Tracks composite CIDs that have already been merged, preventing
     /// duplicate processing from concurrent dual-broadcast paths (doc topic
     /// + collection topic). Matches Go's `loadComposites` dedup guard.
-    pub(crate) merged_composites: std::sync::Mutex<HashSet<Cid>>,
+    pub(crate) merged_composites: CidSet,
     /// Tracks collection CIDs that have already been merged, preventing
     /// replayed collection blocks from re-adding obsolete collection heads.
-    pub(crate) merged_collections: std::sync::Mutex<HashSet<Cid>>,
+    pub(crate) merged_collections: CidSet,
     /// Optional SE encryption key for generating search artifacts on replicated documents.
     /// When set, the merge handler generates SE artifacts after merging documents
     /// that belong to collections with encrypted indexes.
     se_enc_key: std::sync::OnceLock<Zeroizing<Vec<u8>>>,
+    /// Optional repusher for fanning SE artifacts to this node's replicators
+    /// after a merge commits. Mirrors Go, where a merging node re-enters
+    /// `SendUpdate` and runs the SE push handler (`internal/db/p2p/p2p.go:709`).
+    #[cfg(not(target_arch = "wasm32"))]
+    se_repusher: std::sync::OnceLock<Arc<dyn crate::merge::SeArtifactRepusher>>,
     /// Optional KMS service. When set, `decrypt_block_data` routes DEK
     /// retrieval through the KMS (NAC/DAC-gated, cross-peer fetch) instead
     /// of reading the raw key directly from the Encryption block.
@@ -111,7 +127,18 @@ pub struct DbMergeHandler<S: Store, B: blockstore::Blockstore> {
     /// repeated deliveries of the same deferred field block
     /// (pushlog + gossip + retries) don't fan out duplicate cross-peer
     /// fetches.
-    prefetched_dek_cids: Arc<std::sync::Mutex<HashSet<Cid>>>,
+    prefetched_dek_cids: Arc<CidSet>,
+    /// Composites a merge validator deferred, by the CIDs they await.
+    pub(crate) deferred: crate::merge::governance::DeferredMerges,
+    /// Composites a merge validator rejected. A reject rests on present bytes
+    /// and never changes, and the block stays in the blockstore's unmerged
+    /// set, so without this the governance sweep would re-judge every
+    /// rejected composite each tick and, past its budget, never reach a
+    /// deferred one. In memory: after a restart each is re-judged once.
+    pub(crate) rejected_governed: CidSet,
+    /// Where composites merged by re-drive are reported, so they take the
+    /// same post-merge path as a first-attempt merge.
+    redriven_sink: std::sync::OnceLock<Arc<dyn crate::merge::governance::RedrivenMergeSink>>,
 }
 
 impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
@@ -144,7 +171,15 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
         }
         for id in ids() {
             if let Some(stored) = self.db.get_collection_by_version_id_full(id).await? {
-                return Ok(self.db.find_collection_by_id(stored.collection_id())?);
+                // Prefer the cached entry, which carries index action state,
+                // but fall back to the definition just read from the store. A
+                // collection can be durably known and absent from the cache,
+                // which is keyed by name and so holds one collection per name.
+                return Ok(Some(
+                    self.db
+                        .find_collection_by_id(stored.collection_id())?
+                        .unwrap_or(stored),
+                ));
             }
         }
         Ok(None)
@@ -156,12 +191,12 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
     }
 
     /// Collection-definition blocks already merged in this process.
-    pub fn merged_collections(&self) -> &std::sync::Mutex<HashSet<Cid>> {
+    pub fn merged_collections(&self) -> &CidSet {
         &self.merged_collections
     }
 
     /// DEK block CIDs whose prefetch has already been spawned.
-    pub fn prefetched_dek_cids(&self) -> &Arc<std::sync::Mutex<HashSet<Cid>>> {
+    pub fn prefetched_dek_cids(&self) -> &Arc<CidSet> {
         &self.prefetched_dek_cids
     }
 
@@ -182,13 +217,41 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
             blockstore,
             max_merge_depth,
             composite_merge_hook: std::sync::OnceLock::new(),
-            merged_composites: std::sync::Mutex::new(HashSet::new()),
-            merged_collections: std::sync::Mutex::new(HashSet::new()),
+            merged_composites: cid_set(),
+            merged_collections: cid_set(),
             se_enc_key: std::sync::OnceLock::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            se_repusher: std::sync::OnceLock::new(),
             kms: std::sync::OnceLock::new(),
             merge_queue,
-            prefetched_dek_cids: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            prefetched_dek_cids: Arc::new(cid_set()),
+            deferred: Default::default(),
+            rejected_governed: cid_set(),
+            redriven_sink: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Lower the deferred index's capacity, so a test can reach the
+    /// at-capacity path without indexing
+    /// [`crate::merge::governance::MAX_DEFERRED_COMPOSITES`] composites first.
+    /// Nothing in production calls this.
+    pub fn set_deferred_capacity(&self, capacity: usize) {
+        self.deferred.set_capacity(capacity);
+    }
+
+    /// Report composites merged by re-drive to `sink`, which marks them merged
+    /// and fans them out as the replication layer does a first-attempt merge.
+    pub fn set_redriven_merge_sink(
+        &self,
+        sink: Arc<dyn crate::merge::governance::RedrivenMergeSink>,
+    ) {
+        let _ = self.redriven_sink.set(sink);
+    }
+
+    pub(crate) fn redriven_merge_sink(
+        &self,
+    ) -> Option<&Arc<dyn crate::merge::governance::RedrivenMergeSink>> {
+        self.redriven_sink.get()
     }
 
     /// Enforce the same parent-chain depth policy for every merge traversal.
@@ -220,6 +283,39 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
     /// Get the SE encryption key, if configured.
     pub(crate) fn se_enc_key(&self) -> Option<&[u8]> {
         self.se_enc_key.get().map(|k| k.as_slice())
+    }
+
+    /// Set the SE artifact repusher used to fan artifacts to replicators after a merge commits.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_se_repusher(&self, repusher: Arc<dyn crate::merge::SeArtifactRepusher>) {
+        let _ = self.se_repusher.set(repusher);
+    }
+
+    /// Post-commit action that regenerates this document's SE artifacts and pushes
+    /// them to the collection's replicators. `None` when no repusher is wired or the
+    /// collection has no encrypted indexes.
+    pub(crate) fn se_post_commit_action(
+        &self,
+        doc_id: &str,
+        collection: &CollectionVersion,
+    ) -> Option<Box<dyn hook::CompositePostCommitAction>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if collection.encrypted_indexes.is_empty() {
+                return None;
+            }
+            let repusher = self.se_repusher.get()?.clone();
+            Some(Box::new(se_merge::SeRepushAction::new(
+                repusher,
+                collection.collection_id.clone(),
+                doc_id.to_string(),
+            )))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (doc_id, collection);
+            None
+        }
     }
 
     /// Set the KMS service. Routes `decrypt_block_data` through the KMS once set.

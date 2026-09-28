@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use document::Document;
 use identity::Did;
+use rapidhash::{HashMapExt, RapidHashMap};
 use storage::corekv::MaybeSendSync;
 
 use crate::doc_stream::DocStream;
@@ -286,6 +287,23 @@ pub trait DocFetcher: MaybeSendSync {
         false
     }
 
+    /// Estimate the index entries `params` would visit, bounded by `cap`.
+    ///
+    /// Index selection uses this to prefer the most selective usable index.
+    /// The estimate ignores limit, offset, cursor, and value filters. Returning
+    /// `cap` also covers exhausting the probe budget before completing a count;
+    /// it must not make an unfinished scan look cheaper than a completed one.
+    /// `None` means this fetcher cannot estimate, so selection uses shape alone.
+    async fn estimate_index_scan(
+        &self,
+        collection_name: &str,
+        params: &IndexScanParams,
+        cap: u64,
+    ) -> Result<Option<u64>> {
+        let _ = (collection_name, params, cap);
+        Ok(None)
+    }
+
     /// Nearest documents to `query_vector` under a vector index, nearest first.
     ///
     /// Returns document short ids, which is what a scan can be narrowed by.
@@ -405,9 +423,9 @@ pub trait DocFetcher: MaybeSendSync {
         collection_name: &str,
         field_name: &str,
         query: &str,
-    ) -> Result<std::collections::HashMap<String, f64>> {
+    ) -> Result<RapidHashMap<String, f64>> {
         let _ = (collection_name, field_name, query);
-        Ok(std::collections::HashMap::new())
+        Ok(RapidHashMap::new())
     }
 }
 

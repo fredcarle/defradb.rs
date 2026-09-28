@@ -6,6 +6,8 @@ use futures::{stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rapidhash::HashSetExt;
+
 use super::SyncCoordinator;
 use crate::error::Result;
 use crate::transport::P2PTransport;
@@ -35,7 +37,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
     pub async fn subscribe_collections(&self, collection_ids: &[String]) -> Result<usize> {
         let _mutation = self.subscriptions.mutation.lock().await;
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rapidhash::RapidHashSet::new();
         let requested = collection_ids
             .iter()
             .filter(|collection_id| seen.insert((*collection_id).clone()))
@@ -51,7 +53,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             .get_all_collections()
             .await?
             .into_iter()
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<rapidhash::RapidHashSet<_>>();
         let desired_missing = requested
             .iter()
             .filter(|collection_id| !desired.contains(collection_id.as_str()))
@@ -64,14 +66,16 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                 .await?;
         }
 
-        let missing = {
-            let subscribed_collections = self.subscriptions.subscribed_collections.read().await;
-            requested
-                .iter()
-                .filter(|collection_id| !subscribed_collections.contains(collection_id.as_str()))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        let missing = requested
+            .iter()
+            .filter(|collection_id| {
+                !self
+                    .subscriptions
+                    .subscribed_collections
+                    .contains_key(collection_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
         if missing.is_empty() {
             return Ok(0);
@@ -82,7 +86,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             .map(move |collection_id| {
                 let broadcaster = broadcaster.clone();
                 async move {
-                    let result = tokio::time::timeout(
+                    let result = n0_future::time::timeout(
                         COLLECTION_SUBSCRIPTION_TIMEOUT,
                         broadcaster.subscribe_collection(&collection_id),
                     )
@@ -119,11 +123,11 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             }
         }
 
-        {
-            let mut subscribed_collections =
-                self.subscriptions.subscribed_collections.write().await;
-            subscribed_collections.extend(installed);
-        }
+        self.subscriptions.subscribed_collections.extend(
+            installed
+                .into_iter()
+                .map(|collection_id| (collection_id, ())),
+        );
 
         tracing::debug!(
             requested = collection_ids.len(),
@@ -158,7 +162,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
     pub async fn unsubscribe_collections(&self, collection_ids: &[String]) -> Result<usize> {
         let _mutation = self.subscriptions.mutation.lock().await;
 
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = rapidhash::RapidHashSet::new();
         let requested = collection_ids
             .iter()
             .filter(|collection_id| seen.insert((*collection_id).clone()))
@@ -183,7 +187,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             .map(move |collection_id| {
                 let broadcaster = broadcaster.clone();
                 async move {
-                    let result = tokio::time::timeout(
+                    let result = n0_future::time::timeout(
                         COLLECTION_SUBSCRIPTION_TIMEOUT,
                         broadcaster.unsubscribe_collection(&collection_id),
                     )
@@ -213,11 +217,11 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             }
         }
 
-        let mut live = self.subscriptions.subscribed_collections.write().await;
         for collection_id in removed {
-            live.remove(&collection_id);
+            self.subscriptions
+                .subscribed_collections
+                .remove(&collection_id);
         }
-        drop(live);
 
         for (collection_id, _) in &failures {
             self.schedule_collection_unsubscribe_retry(collection_id.clone())
@@ -258,11 +262,14 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
     }
 
     async fn schedule_collection_subscribe_retry(&self, collection_id: String) {
-        let mut retrying = self.subscriptions.retrying_subscribes.lock().await;
-        if !retrying.insert(collection_id.clone()) {
+        if self
+            .subscriptions
+            .retrying_subscribes
+            .insert_if_absent(collection_id.clone(), ())
+            .is_some()
+        {
             return;
         }
-        drop(retrying);
 
         let broadcaster = self.runtime.broadcaster.clone();
         let mutation = Arc::clone(&self.subscriptions.mutation);
@@ -277,7 +284,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             loop {
                 tokio::select! {
                     _ = task_shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {}
+                    _ = n0_future::time::sleep(delay) => {}
                 }
 
                 // Desired state, the live cache, and transport installation
@@ -287,7 +294,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                 let _mutation = mutation.lock().await;
                 match collection_store.is_subscribed(&retry_id).await {
                     Ok(false) => {
-                        retrying.lock().await.remove(&retry_id);
+                        retrying.remove(&retry_id);
                         return;
                     }
                     Ok(true) => {}
@@ -302,20 +309,20 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                     }
                 }
 
-                if subscribed.read().await.contains(&retry_id) {
-                    retrying.lock().await.remove(&retry_id);
+                if subscribed.contains_key(&retry_id) {
+                    retrying.remove(&retry_id);
                     return;
                 }
 
-                let result = tokio::time::timeout(
+                let result = n0_future::time::timeout(
                     COLLECTION_SUBSCRIPTION_TIMEOUT,
                     broadcaster.subscribe_collection(&retry_id),
                 )
                 .await;
                 match result {
                     Ok(Ok(_)) => {
-                        subscribed.write().await.insert(retry_id.clone());
-                        retrying.lock().await.remove(&retry_id);
+                        subscribed.insert(retry_id.clone(), ());
+                        retrying.remove(&retry_id);
                         return;
                     }
                     Ok(Err(error)) => tracing::warn!(
@@ -330,24 +337,25 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                 }
                 delay = (delay * 2).min(COLLECTION_SUBSCRIBE_RETRY_MAX);
             }
-            retrying.lock().await.remove(&retry_id);
+            retrying.remove(&retry_id);
         });
 
         if !spawned {
             self.subscriptions
                 .retrying_subscribes
-                .lock()
-                .await
                 .remove(&collection_id);
         }
     }
 
     async fn schedule_collection_unsubscribe_retry(&self, collection_id: String) {
-        let mut retrying = self.subscriptions.retrying_unsubscribes.lock().await;
-        if !retrying.insert(collection_id.clone()) {
+        if self
+            .subscriptions
+            .retrying_unsubscribes
+            .insert_if_absent(collection_id.clone(), ())
+            .is_some()
+        {
             return;
         }
-        drop(retrying);
 
         let broadcaster = self.runtime.broadcaster.clone();
         let mutation = Arc::clone(&self.subscriptions.mutation);
@@ -362,7 +370,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             loop {
                 tokio::select! {
                     _ = task_shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {}
+                    _ = n0_future::time::sleep(delay) => {}
                 }
 
                 // Serialize the durable check and transport cleanup with
@@ -372,7 +380,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                 let _mutation = mutation.lock().await;
                 match collection_store.is_subscribed(&retry_id).await {
                     Ok(true) => {
-                        retrying.lock().await.remove(&retry_id);
+                        retrying.remove(&retry_id);
                         return;
                     }
                     Ok(false) => {}
@@ -387,15 +395,15 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                     }
                 }
 
-                let result = tokio::time::timeout(
+                let result = n0_future::time::timeout(
                     COLLECTION_SUBSCRIPTION_TIMEOUT,
                     broadcaster.unsubscribe_collection(&retry_id),
                 )
                 .await;
                 match result {
                     Ok(Ok(_)) => {
-                        subscribed.write().await.remove(&retry_id);
-                        retrying.lock().await.remove(&retry_id);
+                        subscribed.remove(&retry_id);
+                        retrying.remove(&retry_id);
                         return;
                     }
                     Ok(Err(error)) => tracing::warn!(
@@ -410,14 +418,12 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
                 }
                 delay = (delay * 2).min(COLLECTION_UNSUBSCRIBE_RETRY_MAX);
             }
-            retrying.lock().await.remove(&retry_id);
+            retrying.remove(&retry_id);
         });
 
         if !spawned {
             self.subscriptions
                 .retrying_unsubscribes
-                .lock()
-                .await
                 .remove(&collection_id);
         }
     }
@@ -448,7 +454,7 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             .map(move |collection_id| {
                 let broadcaster = broadcaster.clone();
                 async move {
-                    let result = tokio::time::timeout(
+                    let result = n0_future::time::timeout(
                         COLLECTION_SUBSCRIPTION_TIMEOUT,
                         broadcaster.subscribe_collection(&collection_id),
                     )
@@ -481,11 +487,11 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
             }
         }
         let loaded = installed.len();
-        self.subscriptions
-            .subscribed_collections
-            .write()
-            .await
-            .extend(installed);
+        self.subscriptions.subscribed_collections.extend(
+            installed
+                .into_iter()
+                .map(|collection_id| (collection_id, ())),
+        );
 
         for collection_id in failed {
             self.schedule_collection_subscribe_retry(collection_id)
@@ -530,9 +536,10 @@ impl<B: Blockstore + 'static, T: P2PTransport> SyncCoordinator<B, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use kovan_map::HopscotchMap;
+    use rapidhash::RapidHashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
@@ -555,22 +562,43 @@ mod tests {
     use super::{SyncCoordinator, MAX_CONCURRENT_COLLECTION_SUBSCRIPTIONS};
 
     type TestBlockstore = DefraBlockstore<RegolithStore>;
+    type TopicSet = HopscotchMap<String, (), rapidhash::fast::RandomState>;
+    type TopicCounters = HopscotchMap<String, Arc<AtomicUsize>, rapidhash::fast::RandomState>;
+
+    fn rapid_map<K, V>() -> HopscotchMap<K, V, rapidhash::fast::RandomState>
+    where
+        K: std::hash::Hash + Eq + Clone + 'static,
+        V: Clone + 'static,
+    {
+        HopscotchMap::with_hasher(rapidhash::fast::RandomState::default())
+    }
+
+    /// Consumes one injected failure for `topic`, if any remain.
+    fn take_failure(remaining: &TopicCounters, topic: &str) -> bool {
+        remaining.get(topic).is_some_and(|count| {
+            count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok()
+        })
+    }
 
     #[derive(Clone)]
     struct RecordingTransport {
         peer_id: PeerId,
         pubkey: Vec<u8>,
-        subscribed: Arc<Mutex<HashSet<String>>>,
-        fail_subscribe: Arc<Mutex<HashSet<String>>>,
-        fail_subscribe_remaining: Arc<Mutex<HashMap<String, usize>>>,
-        fail_unsubscribe_remaining: Arc<Mutex<HashMap<String, usize>>>,
+        subscribed: Arc<TopicSet>,
+        fail_subscribe: Arc<TopicSet>,
+        fail_subscribe_remaining: Arc<TopicCounters>,
+        fail_unsubscribe_remaining: Arc<TopicCounters>,
         unsubscribe_started: Option<Arc<tokio::sync::Notify>>,
         unsubscribe_release: Option<Arc<tokio::sync::Notify>>,
         subscribe_calls: Arc<AtomicUsize>,
         subscribe_delay: Duration,
         subscribe_in_flight: Arc<AtomicUsize>,
         max_subscribe_in_flight: Arc<AtomicUsize>,
-        replicators: Arc<Mutex<HashMap<String, Vec<String>>>>,
+        replicators: Arc<HopscotchMap<String, Vec<String>, rapidhash::fast::RandomState>>,
     }
 
     impl RecordingTransport {
@@ -578,33 +606,28 @@ mod tests {
             Self {
                 peer_id: PeerId::new(peer_id.to_string()),
                 pubkey: vec![1, 2, 3],
-                subscribed: Arc::new(Mutex::new(HashSet::new())),
-                fail_subscribe: Arc::new(Mutex::new(HashSet::new())),
-                fail_subscribe_remaining: Arc::new(Mutex::new(HashMap::new())),
-                fail_unsubscribe_remaining: Arc::new(Mutex::new(HashMap::new())),
+                subscribed: Arc::new(rapid_map()),
+                fail_subscribe: Arc::new(rapid_map()),
+                fail_subscribe_remaining: Arc::new(rapid_map()),
+                fail_unsubscribe_remaining: Arc::new(rapid_map()),
                 unsubscribe_started: None,
                 unsubscribe_release: None,
                 subscribe_calls: Arc::new(AtomicUsize::new(0)),
                 subscribe_delay: Duration::ZERO,
                 subscribe_in_flight: Arc::new(AtomicUsize::new(0)),
                 max_subscribe_in_flight: Arc::new(AtomicUsize::new(0)),
-                replicators: Arc::new(Mutex::new(HashMap::new())),
+                replicators: Arc::new(rapid_map()),
             }
         }
 
         fn fail_subscribe(self, topic: &str) -> Self {
-            self.fail_subscribe
-                .lock()
-                .unwrap()
-                .insert(topic.to_string());
+            self.fail_subscribe.insert(topic.to_string(), ());
             self
         }
 
         fn fail_subscribe_once(self, topic: &str) -> Self {
             self.fail_subscribe_remaining
-                .lock()
-                .unwrap()
-                .insert(topic.to_string(), 1);
+                .insert(topic.to_string(), Arc::new(AtomicUsize::new(1)));
             self
         }
 
@@ -619,9 +642,7 @@ mod tests {
 
         fn fail_unsubscribe_times(self, topic: &str, times: usize) -> Self {
             self.fail_unsubscribe_remaining
-                .lock()
-                .unwrap()
-                .insert(topic.to_string(), times);
+                .insert(topic.to_string(), Arc::new(AtomicUsize::new(times)));
             self
         }
 
@@ -644,13 +665,14 @@ mod tests {
         }
 
         fn subscribed_topics(&self) -> Vec<String> {
-            let mut topics: Vec<_> = self.subscribed.lock().unwrap().iter().cloned().collect();
+            let mut topics: Vec<_> = self.subscribed.keys().collect();
             topics.sort();
             topics
         }
     }
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl P2PTransport for RecordingTransport {
         type ResponseToken = ();
 
@@ -705,26 +727,16 @@ mod tests {
             self.max_subscribe_in_flight
                 .fetch_max(in_flight, Ordering::Relaxed);
             if !self.subscribe_delay.is_zero() {
-                tokio::time::sleep(self.subscribe_delay).await;
+                n0_future::time::sleep(self.subscribe_delay).await;
             }
 
-            let should_fail_once = {
-                let mut remaining = self.fail_subscribe_remaining.lock().unwrap();
-                match remaining.get_mut(&topic) {
-                    Some(count) if *count > 0 => {
-                        *count -= 1;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            let result = if should_fail_once || self.fail_subscribe.lock().unwrap().contains(&topic)
-            {
+            let should_fail_once = take_failure(&self.fail_subscribe_remaining, &topic);
+            let result = if should_fail_once || self.fail_subscribe.contains_key(&topic) {
                 Err(crate::error::Error::Transport(format!(
                     "injected subscribe failure for {topic}"
                 )))
             } else {
-                Ok(self.subscribed.lock().unwrap().insert(topic))
+                Ok(self.subscribed.insert_if_absent(topic, ()).is_none())
             };
             self.subscribe_in_flight.fetch_sub(1, Ordering::Relaxed);
             result
@@ -732,16 +744,7 @@ mod tests {
 
         async fn unsubscribe(&self, topic: DefraTopic) -> crate::Result<bool> {
             let topic = topic.topic_string();
-            let should_fail = {
-                let mut remaining = self.fail_unsubscribe_remaining.lock().unwrap();
-                match remaining.get_mut(&topic) {
-                    Some(count) if *count > 0 => {
-                        *count -= 1;
-                        true
-                    }
-                    _ => false,
-                }
-            };
+            let should_fail = take_failure(&self.fail_unsubscribe_remaining, &topic);
             if should_fail {
                 return Err(crate::error::Error::Transport(format!(
                     "injected unsubscribe failure for {topic}"
@@ -753,7 +756,7 @@ mod tests {
             if let Some(release) = &self.unsubscribe_release {
                 release.notified().await;
             }
-            Ok(self.subscribed.lock().unwrap().remove(&topic))
+            Ok(self.subscribed.remove(&topic).is_some())
         }
 
         async fn publish(
@@ -902,15 +905,12 @@ mod tests {
             peer_id: &PeerId,
             collections: Vec<String>,
         ) -> crate::Result<()> {
-            self.replicators
-                .lock()
-                .unwrap()
-                .insert(peer_id.to_string(), collections);
+            self.replicators.insert(peer_id.to_string(), collections);
             Ok(())
         }
 
         async fn delete_replicator(&self, peer_id: &PeerId) -> crate::Result<()> {
-            self.replicators.lock().unwrap().remove(peer_id.as_str());
+            self.replicators.remove(peer_id.as_str());
             Ok(())
         }
 
@@ -935,11 +935,20 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct RecordingCollectionStore {
-        collections: Mutex<HashSet<String>>,
+        collections: TopicSet,
         add_batches: AtomicUsize,
         remove_batches: AtomicUsize,
+    }
+
+    impl Default for RecordingCollectionStore {
+        fn default() -> Self {
+            Self {
+                collections: rapid_map(),
+                add_batches: AtomicUsize::new(0),
+                remove_batches: AtomicUsize::new(0),
+            }
+        }
     }
 
     impl RecordingCollectionStore {
@@ -947,8 +956,8 @@ mod tests {
             self.add_batches.load(Ordering::Relaxed)
         }
 
-        fn collections(&self) -> HashSet<String> {
-            self.collections.lock().unwrap().clone()
+        fn collections(&self) -> RapidHashSet<String> {
+            self.collections.keys().collect()
         }
 
         fn remove_batches(&self) -> usize {
@@ -956,23 +965,22 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl P2PCollectionStorage for RecordingCollectionStore {
         async fn add_collection(&self, collection_id: &str) -> crate::Result<()> {
             self.add_batches.fetch_add(1, Ordering::Relaxed);
-            self.collections
-                .lock()
-                .unwrap()
-                .insert(collection_id.to_string());
+            self.collections.insert(collection_id.to_string(), ());
             Ok(())
         }
 
         async fn add_collections(&self, collection_ids: &[String]) -> crate::Result<()> {
             self.add_batches.fetch_add(1, Ordering::Relaxed);
-            self.collections
-                .lock()
-                .unwrap()
-                .extend(collection_ids.iter().cloned());
+            self.collections.extend(
+                collection_ids
+                    .iter()
+                    .map(|collection_id| (collection_id.clone(), ())),
+            );
             Ok(())
         }
 
@@ -982,19 +990,18 @@ mod tests {
 
         async fn remove_collections(&self, collection_ids: &[String]) -> crate::Result<()> {
             self.remove_batches.fetch_add(1, Ordering::Relaxed);
-            let mut collections = self.collections.lock().unwrap();
             for collection_id in collection_ids {
-                collections.remove(collection_id);
+                self.collections.remove(collection_id);
             }
             Ok(())
         }
 
         async fn get_all_collections(&self) -> crate::Result<Vec<String>> {
-            Ok(self.collections.lock().unwrap().iter().cloned().collect())
+            Ok(self.collections.keys().collect())
         }
 
         async fn is_subscribed(&self, collection_id: &str) -> crate::Result<bool> {
-            Ok(self.collections.lock().unwrap().contains(collection_id))
+            Ok(self.collections.contains_key(collection_id))
         }
     }
 
@@ -1109,7 +1116,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_iter()
-                .collect::<HashSet<_>>(),
+                .collect::<RapidHashSet<_>>(),
             collections.iter().cloned().collect(),
             "list reports durable desired state even while one live install needs healing"
         );
@@ -1157,12 +1164,12 @@ mod tests {
         assert!(transport.subscribed_topics().is_empty());
         assert_eq!(collection_store.add_batches(), 1);
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
                 if transport.subscribed_topics() == vec!["users"] {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1171,15 +1178,8 @@ mod tests {
         assert!(coordinator
             .subscriptions
             .subscribed_collections
-            .read()
-            .await
-            .contains("users"));
-        assert!(coordinator
-            .subscriptions
-            .retrying_subscribes
-            .lock()
-            .await
-            .is_empty());
+            .contains_key("users"));
+        assert!(coordinator.subscriptions.retrying_subscribes.is_empty());
         assert_eq!(transport.subscribe_calls(), 2);
         assert_eq!(collection_store.add_batches(), 1);
     }
@@ -1235,12 +1235,12 @@ mod tests {
         );
         assert!(transport.subscribed_topics().is_empty());
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
                 if transport.subscribed_topics() == vec!["users"] {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1248,12 +1248,7 @@ mod tests {
 
         assert_eq!(transport.subscribe_calls(), 2);
         assert_eq!(collection_store.add_batches(), 1);
-        assert!(coordinator
-            .subscriptions
-            .retrying_subscribes
-            .lock()
-            .await
-            .is_empty());
+        assert!(coordinator.subscriptions.retrying_subscribes.is_empty());
     }
 
     #[tokio::test]
@@ -1323,30 +1318,23 @@ mod tests {
             coordinator
                 .subscriptions
                 .subscribed_collections
-                .read()
-                .await
-                .contains("users"),
+                .contains_key("users"),
             "failed live removal must remain cached for retry"
         );
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
                 if transport.subscribed_topics().is_empty() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("background unsubscribe retry should converge");
         assert!(transport.subscribed_topics().is_empty());
         assert!(
-            coordinator
-                .subscriptions
-                .subscribed_collections
-                .read()
-                .await
-                .is_empty(),
+            coordinator.subscriptions.subscribed_collections.is_empty(),
             "successful background retry must retire the live topic"
         );
         assert_eq!(collection_store.remove_batches(), 1);
@@ -1381,7 +1369,7 @@ mod tests {
             coordinator.get_subscribed_collections().await.unwrap(),
             vec!["users".to_string()]
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        n0_future::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             transport.subscribed_topics(),
             vec!["users"],
@@ -1430,10 +1418,11 @@ mod tests {
 
         retry_started.notified().await;
         let retrying_coordinator = Arc::clone(&coordinator);
-        let mut resubscribe =
-            tokio::spawn(async move { retrying_coordinator.subscribe_collection("users").await });
+        let mut resubscribe = n0_future::task::spawn(async move {
+            retrying_coordinator.subscribe_collection("users").await
+        });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut resubscribe)
+            n0_future::time::timeout(Duration::from_millis(50), &mut resubscribe)
                 .await
                 .is_err(),
             "foreground re-subscribe must wait for in-flight cleanup"
@@ -1471,18 +1460,12 @@ mod tests {
             .expect_err("first unsubscribe should fail");
         assert!(!coordinator.subscribe_collection("users").await.unwrap());
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
-                if coordinator
-                    .subscriptions
-                    .retrying_unsubscribes
-                    .lock()
-                    .await
-                    .is_empty()
-                {
+                if coordinator.subscriptions.retrying_unsubscribes.is_empty() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1492,12 +1475,12 @@ mod tests {
             .unsubscribe_collection("users")
             .await
             .expect_err("second unsubscribe should exercise a fresh retry owner");
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
                 if transport.subscribed_topics().is_empty() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1545,12 +1528,12 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        tokio::time::timeout(Duration::from_secs(2), async {
+        n0_future::time::timeout(Duration::from_secs(2), async {
             loop {
                 if transport.subscribed_topics().is_empty() {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                n0_future::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

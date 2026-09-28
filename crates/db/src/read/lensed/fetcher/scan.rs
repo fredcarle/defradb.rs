@@ -1,6 +1,6 @@
 //! Index scan implementation for LensedDocFetcher.
 
-use std::collections::HashSet;
+use rapidhash::{HashSetExt, RapidHashSet};
 
 use defra_core::thread_bounds::MaybeBoxFuture;
 use query::planner::index_selection::{IndexScanParams, IndexScanType};
@@ -14,6 +14,35 @@ use crate::read::seek::apply_cursor_seek_to_iterator;
 use super::LensedDocFetcher;
 
 impl<S: Store + 'static> LensedDocFetcher<S> {
+    /// Count the index entries `params` would visit, stopping at `cap`.
+    pub(super) async fn estimate_index_scan_inner(
+        &self,
+        collection_name: &str,
+        params: &IndexScanParams,
+        cap: u64,
+    ) -> query::error::Result<Option<u64>> {
+        let (collection, datastore, _) =
+            get_collection_with_lazy_load(&self.txn, collection_name).await?;
+        let index_manager = IndexManager::from_indexes(
+            collection.resolved_root_id(),
+            collection.schema(),
+            collection.write_indexes(),
+        )
+        .map_err(|e| query::error::QueryError::execution(format!("index manager error: {}", e)))?;
+        let Some(index) = index_manager.get_index(&params.index_name) else {
+            return Ok(None);
+        };
+        let count = crate::read::index_count::count_index_scan(
+            index,
+            &datastore,
+            &params.scan_type,
+            usize::try_from(cap).unwrap_or(usize::MAX),
+        )
+        .await
+        .map_err(|e| query::error::QueryError::execution(format!("index count error: {}", e)))?;
+        Ok(Some(count as u64))
+    }
+
     pub(super) fn get_by_index_scan_impl<'a>(
         &'a self,
         collection_name: &'a str,
@@ -114,7 +143,7 @@ impl<S: Store + 'static> LensedDocFetcher<S> {
                         && suffix_values.len() == index.description().fields.len() - 1;
                     let mut all_doc_short_ids = Vec::new();
                     let mut group_lens = Vec::new();
-                    let mut seen_short_ids = HashSet::new();
+                    let mut seen_short_ids = RapidHashSet::new();
                     let mut raw_count = 0u64;
                     for value in values {
                         let entries = if has_full_key {
@@ -245,7 +274,7 @@ impl<S: Store + 'static> LensedDocFetcher<S> {
                         total_raw_fetches += branch_result.raw_fetches();
                         all_doc_ids.extend(branch_result.doc_ids().iter().cloned());
                     }
-                    let mut seen = HashSet::new();
+                    let mut seen = RapidHashSet::new();
                     let doc_ids: Vec<String> = all_doc_ids
                         .into_iter()
                         .filter(|id| seen.insert(id.clone()))
@@ -258,7 +287,7 @@ impl<S: Store + 'static> LensedDocFetcher<S> {
                 _ => unreachable!(),
             };
 
-        let mut seen = HashSet::new();
+        let mut seen = RapidHashSet::new();
         let doc_short_ids: Vec<u64> = raw_doc_short_ids
             .into_iter()
             .filter(|id| seen.insert(*id))

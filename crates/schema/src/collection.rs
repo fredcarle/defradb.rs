@@ -5,8 +5,8 @@ use crate::{
     FieldKind, FullTextIndexDescription, IndexDescription, PolicyDescription, QuerySource, Result,
     SchemaError, VectorEmbeddingDescription,
 };
+use rapidhash::{HashSetExt, RapidHashMap, RapidHashSet};
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// Sentinel collection ID for placeholder versions whose real collection is unknown.
@@ -110,6 +110,32 @@ pub struct CollectionVersion {
     /// Access control policy for this collection
     #[serde(rename = "Policy", default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyDescription>,
+
+    /// The CID this version's identity binds its policy by, when the record
+    /// was rebuilt from a synced definition block.
+    ///
+    /// The block carries the policy as a CID over its reference and not the
+    /// reference itself, so a rebuilt record may hold the binding without
+    /// the policy. Set alongside `policy` when a held version supplied the
+    /// reference the CID names, and without it otherwise; in that second
+    /// case the version must not be activated, since it would serve the
+    /// collection with no policy at all. Never set on a locally defined
+    /// version, whose policy is in hand.
+    #[serde(rename = "PolicyCID", default, skip_serializing_if = "Option::is_none")]
+    pub policy_cid: Option<String>,
+
+    /// The governance root this collection is claimed by, from `@governed`.
+    ///
+    /// A self-addressing identifier rather than a bare public key, so one
+    /// identifier covers key rotation and a later change of signing
+    /// threshold, and the collection identity survives both. Hashed into the
+    /// collection ID when present; absent leaves the identity untouched.
+    #[serde(
+        rename = "GovernanceRoot",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub governance_root: Option<String>,
 
     /// Whether this is the active version
     #[serde(rename = "IsActive", default = "default_active")]
@@ -215,6 +241,8 @@ impl CollectionVersion {
             encrypted_indexes: Vec::new(),
             fulltext_indexes: Vec::new(),
             policy: None,
+            policy_cid: None,
+            governance_root: None,
             is_active: true,
             is_materialized: true,
             downsample_interval: None,
@@ -250,6 +278,12 @@ impl CollectionVersion {
     /// Set the access control policy.
     pub fn with_policy(mut self, policy: PolicyDescription) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    /// Set the governance root that claims this collection.
+    pub fn with_governance_root(mut self, root: impl Into<String>) -> Self {
+        self.governance_root = Some(root.into());
         self
     }
 
@@ -345,7 +379,7 @@ impl CollectionVersion {
     }
 
     fn validate_no_duplicate_index_names(&self) -> Result<()> {
-        let mut seen = HashSet::new();
+        let mut seen = RapidHashSet::new();
         for index in &self.indexes {
             if !seen.insert(&index.name) {
                 return Err(SchemaError::DuplicateIndexName(index.name.clone()));
@@ -355,7 +389,7 @@ impl CollectionVersion {
     }
 
     fn validate_encrypted_indexes(&self) -> Result<()> {
-        let mut encrypted_fields = HashSet::new();
+        let mut encrypted_fields = RapidHashSet::new();
         for index in &self.encrypted_indexes {
             if self.field_by_name(&index.field_name).is_none() {
                 return Err(SchemaError::EncryptedIndexUnknownField(
@@ -461,7 +495,7 @@ impl CollectionVersion {
     /// Validate with access to other collections for relation checking
     pub fn validate_with_collections(
         &self,
-        collections: &HashMap<String, CollectionVersion>,
+        collections: &RapidHashMap<String, CollectionVersion>,
     ) -> Result<()> {
         self.validate()?;
         self.validate_relations(collections)?;
@@ -469,7 +503,7 @@ impl CollectionVersion {
     }
 
     fn validate_no_duplicate_names(&self) -> Result<()> {
-        let mut seen = HashSet::new();
+        let mut seen = RapidHashSet::new();
         for field in &self.fields {
             if !seen.insert(&field.name) {
                 return Err(SchemaError::DuplicateFieldName(field.name.clone()));
@@ -485,7 +519,10 @@ impl CollectionVersion {
         Ok(())
     }
 
-    fn validate_relations(&self, collections: &HashMap<String, CollectionVersion>) -> Result<()> {
+    fn validate_relations(
+        &self,
+        collections: &RapidHashMap<String, CollectionVersion>,
+    ) -> Result<()> {
         for field in self.relation_fields() {
             if let Some(collection_id) = field.kind.relation_collection_id() {
                 if !collections.contains_key(collection_id) {

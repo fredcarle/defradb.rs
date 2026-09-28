@@ -45,9 +45,9 @@ use acp::nac::NodePermission;
 use acp::{DocumentACP, Identity as AcpIdentity};
 use async_trait::async_trait;
 use identity::Did;
+use rapidhash::{HashMapExt, RapidHashMap};
 use schema::CollectionVersion;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::document::DocumentMapping;
@@ -225,6 +225,10 @@ pub struct QueryRunner<F: DocFetcher, R: TransactionRegistry = NoOpTransactionRe
     /// replicators (Go semantics) instead of resolving against local plaintext.
     /// `None` keeps the back-compat local-plaintext path (unit/FFI/non-P2P).
     pub(crate) se_transport: Option<Arc<dyn SeQueryTransport>>,
+    /// App read validator, checked after ACP on every read path.
+    pub(crate) read_validator: Option<Arc<dyn crate::access_hooks::ReadValidator>>,
+    /// App write validator, checked before ACP on every mutation.
+    pub(crate) write_validator: Option<Arc<dyn crate::access_hooks::WriteValidator>>,
 }
 
 impl<F: DocFetcher + 'static> QueryRunner<F, NoOpTransactionRegistry> {
@@ -245,6 +249,8 @@ impl<F: DocFetcher + 'static> QueryRunner<F, NoOpTransactionRegistry> {
             nac: Arc::new(NoOpNacChecker),
             query_timeout: 30,
             query_limits: QueryLimits::default(),
+            read_validator: None,
+            write_validator: None,
             se_transport: None,
         }
     }
@@ -266,6 +272,8 @@ impl<F: DocFetcher + 'static> QueryRunner<F, NoOpTransactionRegistry> {
             nac: Arc::new(NoOpNacChecker),
             query_timeout: 30,
             query_limits: QueryLimits::default(),
+            read_validator: None,
+            write_validator: None,
             se_transport: None,
         }
     }
@@ -289,6 +297,8 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             nac: Arc::new(NoOpNacChecker),
             query_timeout: 30,
             query_limits: QueryLimits::default(),
+            read_validator: None,
+            write_validator: None,
             se_transport: None,
         }
     }
@@ -315,6 +325,8 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             nac: Arc::new(NoOpNacChecker),
             query_timeout: 30,
             query_limits: QueryLimits::default(),
+            read_validator: None,
+            write_validator: None,
             se_transport: None,
         }
     }
@@ -340,6 +352,8 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             nac: Arc::new(NoOpNacChecker),
             query_timeout: 30,
             query_limits: QueryLimits::default(),
+            read_validator: None,
+            write_validator: None,
             se_transport: None,
         }
     }
@@ -368,6 +382,75 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         }
         self.acp = acp;
         self
+    }
+
+    /// Gate what clients read with an app validator. It narrows ACP and
+    /// never widens it.
+    pub fn with_read_validator(
+        mut self,
+        validator: Arc<dyn crate::access_hooks::ReadValidator>,
+    ) -> Self {
+        self.read_validator = Some(validator);
+        self
+    }
+
+    /// Refuse client mutations with an app validator before any block is built.
+    pub fn with_write_validator(
+        mut self,
+        validator: Arc<dyn crate::access_hooks::WriteValidator>,
+    ) -> Self {
+        self.write_validator = Some(validator);
+        self
+    }
+
+    /// Whether the app read validator, if any governs `collection`, lets this
+    /// identity read `doc_id`.
+    pub(crate) async fn app_may_read(
+        &self,
+        identity: Option<&Did>,
+        collection: &CollectionVersion,
+        doc_id: &str,
+    ) -> bool {
+        let Some(validator) = self
+            .read_validator
+            .as_ref()
+            .filter(|validator| validator.governs(collection))
+        else {
+            return true;
+        };
+        let request = crate::access_hooks::ReadRequest {
+            identity,
+            collection,
+            doc_id,
+        };
+        validator.may_read(&request).await.unwrap_or_else(|error| {
+            tracing::warn!(%doc_id, collection = %collection.name, %error, "Read validator failed, hiding document");
+            false
+        })
+    }
+
+    /// Doc IDs the app read validator lets this identity read.
+    pub(crate) async fn app_readable_ids(
+        &self,
+        identity: Option<&Did>,
+        collection: &CollectionVersion,
+        doc_ids: Vec<String>,
+    ) -> Vec<String> {
+        let mut readable = Vec::with_capacity(doc_ids.len());
+        for doc_id in doc_ids {
+            if self.app_may_read(identity, collection, &doc_id).await {
+                readable.push(doc_id);
+            }
+        }
+        readable
+    }
+
+    pub(crate) fn app_read_check(
+        &self,
+        identity: Option<Did>,
+        collection: &CollectionVersion,
+    ) -> Option<crate::access_hooks::AppReadCheck> {
+        crate::access_hooks::AppReadCheck::bind(self.read_validator.as_ref(), identity, collection)
     }
 
     /// Set the searchable-encryption remote query transport.
@@ -438,6 +521,21 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         current_txn_collection_provider().unwrap_or_else(|| self.collection_provider.clone())
     }
 
+    pub(crate) fn transaction_collection_provider(
+        &self,
+        handle: &crate::txn::TransactionHandle,
+    ) -> Result<Arc<dyn CollectionProvider>> {
+        let context = self
+            .registry
+            .get(handle)
+            .into_result()
+            .map_err(|error| QueryError::execution(error.to_string()))?
+            .ok_or_else(|| QueryError::execution(format!("transaction '{handle}' not found")))?;
+        Ok(context
+            .collection_provider()
+            .unwrap_or_else(|| self.collection_provider.clone()))
+    }
+
     /// Get the names of all collections.
     ///
     /// Returns a sorted list of collection names registered with this runner.
@@ -466,14 +564,16 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             .ok_or_else(|| QueryError::collection_not_found(name))
     }
 
-    /// Get all collections as a HashMap for operations that need multiple collections.
+    /// Get all collections as a RapidHashMap for operations that need multiple collections.
     ///
     /// This is used internally for plan building which requires access to multiple
     /// collection schemas simultaneously (e.g., for joins).
-    pub(crate) async fn collections_map(&self) -> Result<HashMap<String, Arc<CollectionVersion>>> {
+    pub(crate) async fn collections_map(
+        &self,
+    ) -> Result<RapidHashMap<String, Arc<CollectionVersion>>> {
         let provider = self.effective_provider();
         let names = provider.list_collections().await?;
-        let mut map = HashMap::new();
+        let mut map = RapidHashMap::new();
         for name in names {
             if let Some(coll) = provider.get_collection(&name).await? {
                 map.insert(name, coll);

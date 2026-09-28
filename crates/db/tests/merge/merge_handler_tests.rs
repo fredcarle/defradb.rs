@@ -42,11 +42,11 @@ use events::Bus;
 use events::ChannelBus;
 use events::EventName;
 use query::txn::TransactionRegistry;
+use rapidhash::{HashSetExt, RapidHashSet};
 use schema::CType;
 use schema::CollectionVersion;
 use schema::FieldDescription;
 use schema::FieldKind;
-use std::collections::HashSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -328,7 +328,7 @@ impl CompositeMergeHook for FailingCompositeHook {
     }
 }
 
-async fn build_merge_block(
+pub(super) async fn build_merge_block(
     blockstore: &Arc<DefraBlockstore<RegolithStore>>,
     name: &str,
     age: i64,
@@ -684,6 +684,37 @@ async fn verify_corrupt_signature_block_returns_error() {
     ));
 }
 
+#[tokio::test]
+async fn verify_signature_rejects_non_utf8_identity() {
+    let (handler, blockstore) = make_handler();
+    let mut block = make_lww_block(None);
+    sign_block_ed25519(&mut block, &blockstore).await;
+    let bytes = blockstore
+        .get(&block.signature.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut signature = Signature::from_dag_cbor(&bytes).unwrap();
+    signature.header.identity.push(0xff);
+    let signature_cid = signature.generate_cid().unwrap();
+    blockstore
+        .put(&signature_cid, &signature.to_dag_cbor().unwrap())
+        .await
+        .unwrap();
+    block.signature = Some(signature_cid);
+    let result = handler
+        .verify_block_signature(
+            &block.generate_cid().unwrap(),
+            &block,
+            &block.to_dag_cbor().unwrap(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(MergeError::SignatureVerificationFailed { reason, .. })
+        if reason.contains("not valid UTF-8"))
+    );
+}
+
 /// Helper: sign a block with a BLS12-381 key (using blst directly), store signature in blockstore.
 /// Returns (hex_pubkey, did).
 async fn sign_block_bls(
@@ -703,12 +734,12 @@ async fn sign_block_bls(
     let did = crypto::keys::PublicKey::did(&bls_pub).unwrap();
 
     let signed_bytes = block.to_dag_cbor().unwrap();
-    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_";
-    let sig = sk.sign(&signed_bytes, dst, &[]);
+    let dst = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_AUG_";
+    let sig = sk.sign(&signed_bytes, dst, &pk_bytes);
     let sig_bytes = sig.compress().to_vec();
 
     let sig_block = Signature::new(
-        SignatureHeader::new(SignatureType::BLS, pub_hex.as_bytes().to_vec()),
+        SignatureHeader::new(SignatureType::BLSAugV1, pub_hex.as_bytes().to_vec()),
         sig_bytes,
     );
     let sig_data = sig_block.to_dag_cbor().unwrap();
@@ -1093,7 +1124,7 @@ async fn interactive_counter_increment_conflicts_with_concurrent_same_doc_merge(
     let mut update_doc = Document::from_json_str(r#"{"score": 13}"#).unwrap();
     update_doc.set_id(document::DocID::from_string(&doc_id).unwrap());
     update_doc.set_counter_delta("score".to_string(), NormalValue::Int(3));
-    let mut modified = std::collections::HashSet::new();
+    let mut modified = rapidhash::RapidHashSet::new();
     modified.insert("score".to_string());
     mutator
         .update("Counters", update_doc, modified)
@@ -1159,7 +1190,7 @@ async fn interactive_counter_increment_conflicts_with_concurrent_same_doc_merge(
     let mut retry_doc = Document::from_json_str(r#"{"score": 18}"#).unwrap();
     retry_doc.set_id(document::DocID::from_string(&doc_id).unwrap());
     retry_doc.set_counter_delta("score".to_string(), NormalValue::Int(3));
-    let mut modified = std::collections::HashSet::new();
+    let mut modified = rapidhash::RapidHashSet::new();
     modified.insert("score".to_string());
     mutator
         .update("Counters", retry_doc, modified)
@@ -2126,7 +2157,7 @@ async fn composite_lww_reseeds_from_local_doc_when_crdt_store_is_stale() {
     let doc_id_str = doc_id.to_string();
 
     doc.set("age", NormalValue::Int(60));
-    let mut modified_fields = HashSet::new();
+    let mut modified_fields = RapidHashSet::new();
     modified_fields.insert("age".to_string());
     {
         let txn = handler.db().new_txn(false).await.unwrap();
@@ -2541,14 +2572,7 @@ async fn deep_collection_parent_chain_merges_on_worker_stack() {
     .expect("collection merge task should not overflow its worker stack");
 
     assert!(outcome.is_terminal_skip());
-    assert_eq!(
-        handler
-            .merged_collections()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .len(),
-        256
-    );
+    assert_eq!(handler.merged_collections().len(), 256);
 }
 
 #[tokio::test]
@@ -2873,11 +2897,7 @@ async fn dek_prefetch_can_restart_after_completion() {
         timeout(Duration::from_secs(1), async {
             loop {
                 let calls = kms.calls.load(std::sync::atomic::Ordering::SeqCst);
-                let finished = !handler
-                    .prefetched_dek_cids()
-                    .lock()
-                    .unwrap()
-                    .contains(&enc_cid);
+                let finished = !handler.prefetched_dek_cids().contains_key(&enc_cid);
                 if calls == expected_calls && finished {
                     break;
                 }

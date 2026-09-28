@@ -1,9 +1,9 @@
 //! Planner orchestration and post-processing for nested queries.
 
 use identity::Did;
+use rapidhash::{HashSetExt, RapidHashSet};
 use schema::CollectionVersion;
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, instrument};
 use web_time::Instant;
@@ -11,6 +11,7 @@ use web_time::Instant;
 use crate::error::Result;
 use crate::executor::GqlWarning;
 use crate::mapper::{Requestable, Select};
+use crate::planner::index_selection::estimate_select;
 use crate::planner::Planner;
 use crate::txn::TransactionRegistry;
 
@@ -64,11 +65,15 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             .await?;
         profile.precompute_fulltext_elapsed = precompute_fulltext_start.elapsed();
 
+        let index_estimates = estimate_select(fetcher, &collection, select).await?;
+
         let plan_build_start = Instant::now();
         let mut planner = Planner::new(collections)
             .with_query_limits(self.query_limits)
             .with_fetcher(Arc::new(fetcher_arc))
-            .with_acp(self.acp.clone(), identity);
+            .with_acp(self.acp.clone(), identity)
+            .with_read_validator(self.read_validator.clone())
+            .with_index_estimates(index_estimates);
         if !fts_scores.is_empty() {
             planner = planner.with_fts_scores(fts_scores);
         }
@@ -262,14 +267,14 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         select: &Select,
     ) -> Vec<JsonValue> {
         // Build map of relation output_name -> allowed sub-field names
-        let mut relation_allowed_fields: Vec<(String, HashSet<String>)> = Vec::new();
+        let mut relation_allowed_fields: Vec<(String, RapidHashSet<String>)> = Vec::new();
 
         for requestable in &select.fields {
             if let Requestable::Select(nested_select) = requestable {
                 if nested_select.field.name == "GROUP" {
                     continue;
                 }
-                let mut allowed = HashSet::new();
+                let mut allowed = RapidHashSet::new();
                 // _docID is always implicit
                 allowed.insert("_docID".to_string());
                 for sub_field in &nested_select.fields {

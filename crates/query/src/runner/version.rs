@@ -7,9 +7,9 @@
 
 use acp::{DocumentPermission, Identity};
 use identity::Did;
+use rapidhash::{HashSetExt, RapidHashSet};
 use schema::CollectionVersion;
 use serde_json::Value as JsonValue;
-use std::collections::HashSet;
 
 use crate::error::{QueryError, Result};
 use crate::executor::GqlWarning;
@@ -55,7 +55,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         // Fetch document(s) at the specified CIDs.
         // For collection-level CIDs (branchable), this returns multiple documents.
         // For document-level CIDs, this returns a single document.
-        let mut seen_cids = HashSet::new();
+        let mut seen_cids = RapidHashSet::new();
         let mut documents = Vec::new();
         for cid in cids {
             if !seen_cids.insert(cid.clone()) {
@@ -89,6 +89,7 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         // Apply ACP filtering: check read permission for each reconstructed document.
         // CID-based time-travel queries must enforce the same ACP rules as regular queries.
         // Documents the caller lacks read permission for are silently excluded (Go behavior).
+        let app_identity = caller_identity.clone();
         let documents = if let Some(ref policy) = collection.policy {
             let identity = Identity::from(caller_identity);
             let mut permitted = Vec::with_capacity(documents.len());
@@ -126,6 +127,17 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         } else {
             documents
         };
+        let mut readable = Vec::with_capacity(documents.len());
+        for (doc, cid) in documents {
+            let doc_id = doc.id().map(|id| id.to_string()).unwrap_or_default();
+            if self
+                .app_may_read(app_identity.as_ref(), &collection, &doc_id)
+                .await
+            {
+                readable.push((doc, cid));
+            }
+        }
+        let documents = readable;
 
         let documents = if let Some(ref filter) = select.filter {
             let mut filtered = Vec::with_capacity(documents.len());

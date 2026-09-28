@@ -162,6 +162,7 @@ impl<S: Store + 'static> DbDocMutator<S> {
             txn,
             self.db.event_bus(),
             self.broadcaster.as_ref(),
+            self.db.local_commit_release(),
             collection_name,
             collection_id,
             doc_id,
@@ -361,7 +362,7 @@ impl<S: Store + 'static> DocMutator for DbDocMutator<S> {
         &self,
         collection_name: &str,
         mut doc: Document,
-        modified_fields: std::collections::HashSet<String>,
+        modified_fields: rapidhash::RapidHashSet<String>,
     ) -> query::error::Result<UpdateResult> {
         self.db
             .check_node_access(None, acp::nac::NodePermission::DocumentUpdate)

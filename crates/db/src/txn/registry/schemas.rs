@@ -43,6 +43,9 @@ impl<S: Store + 'static> DbTransactionRegistry<S> {
             .await?;
         let transform_id = outcome.transform_id.clone();
         let updated_destination = outcome.updated_destination.clone();
+        let updated_collection =
+            Collection::load_index_actions(updated_destination.clone(), &txn.systemstore()?)
+                .await?;
         ctx.invalidate_migration_cache().await;
 
         let db = self.db.clone();
@@ -53,6 +56,7 @@ impl<S: Store + 'static> DbTransactionRegistry<S> {
             let config = config.clone();
             let transform_id = transform_id_for_commit.clone();
             let updated_destination = updated_destination.clone();
+            let updated_collection = updated_collection.clone();
             let destination_version_id = destination_version_id.clone();
             Box::pin(async move {
                 db.bump_migration_generation();
@@ -69,16 +73,22 @@ impl<S: Store + 'static> DbTransactionRegistry<S> {
                 }
 
                 if !updated_destination.name.is_empty() {
-                    if let Ok(mut cache) = db.collections.write() {
-                        if let Some(cached) = cache.get(&updated_destination.name) {
-                            if cached.schema().version_id == destination_version_id {
-                                cache.insert(
-                                    updated_destination.name.clone(),
-                                    Collection::new(updated_destination.clone()),
-                                );
-                            }
+                    db.collections.rcu(|old| {
+                        let mut cache = old.clone();
+                        let matches_destination =
+                            cache.get(&updated_destination.name).is_some_and(|cached| {
+                                cached.schema().version_id == destination_version_id
+                            });
+                        if matches_destination {
+                            // `updated_collection` carries this transaction's
+                            // index actions; a plain entry would drop them.
+                            cache.put_named(
+                                &updated_destination.name.clone(),
+                                updated_collection.clone(),
+                            );
                         }
-                    }
+                        cache
+                    });
 
                     if let Err(error) = db
                         .maybe_reindex_after_migration(
@@ -137,7 +147,7 @@ impl<S: Store + 'static> DbTransactionRegistry<S> {
         let mut txn_guard = shared_txn.lock().await;
         let txn = txn_guard.as_mut().ok_or(Error::TxnNotActive)?;
 
-        let known_types: std::collections::HashSet<String> = self
+        let known_types: rapidhash::RapidHashSet<String> = self
             .db
             .list_collections()
             .map_err(|e| Error::Other(format!("failed to list collections: {}", e)))?
@@ -169,15 +179,22 @@ impl<S: Store + 'static> DbTransactionRegistry<S> {
         // Register on_success callback to update the process-wide cache after commit
         let db = self.db.clone();
         let schemas_for_cache = finalized.clone();
+        let mut collections_for_cache = Vec::with_capacity(finalized.len());
+        for schema in &finalized {
+            collections_for_cache
+                .push(Collection::load_index_actions(schema.clone(), &txn.systemstore()?).await?);
+        }
         txn.on_success(Box::new(move || {
             for schema in &schemas_for_cache {
                 let _ = db.unforbid_collection_id(&schema.collection_id);
             }
-            if let Ok(mut cache) = db.collections.write() {
-                for schema in &schemas_for_cache {
-                    cache.insert(schema.name.clone(), Collection::new(schema.clone()));
+            db.collections.rcu(|old| {
+                let mut cache = old.clone();
+                for collection in &collections_for_cache {
+                    cache.put(collection.clone());
                 }
-            }
+                cache
+            });
         }))?;
 
         Ok(finalized)

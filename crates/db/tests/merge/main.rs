@@ -4,15 +4,16 @@
 mod common;
 
 mod acp_merge_handler;
+mod acp_protected_update;
 mod broadcast_mutator_broadcast;
-mod browser_sync_collection_commit;
-mod browser_sync_collection_commit_recovery;
-mod browser_sync_tests;
+mod collection_block_links;
 mod collection_guard_race;
 mod collection_heads;
+mod governance;
 mod head_provider;
 mod merge_handler_composite_persist;
 mod merge_handler_se_merge;
+mod merge_handler_se_repush;
 mod merge_handler_tests;
 mod peer_identity;
 mod push_docs_common;
@@ -25,3 +26,4 @@ mod se_receiver;
 mod se_storage;
 mod se_validate;
 mod single_root_batch;
+mod synced_definition_cache;

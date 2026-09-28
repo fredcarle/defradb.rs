@@ -1,8 +1,10 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use blockstore::Blockstore;
+use kovan_map::HopscotchMap;
+use rapidhash::fast::RandomState;
+use rapidhash::{HashSetExt, RapidHashSet};
 
 use crate::transport_doc_pusher::TransportDocPusher;
 use crate::transport_version_syncer::TransportVersionSyncer;
@@ -30,8 +32,8 @@ pub struct IrohP2PAdapter<B: Blockstore + 'static> {
     event_bus: Option<Arc<dyn events::Bus>>,
     version_syncer: Option<Arc<dyn TransportVersionSyncer>>,
     replicator_push_options: ReplicatorPushOptionsState,
-    peer_addresses: Arc<std::sync::RwLock<HashMap<String, String>>>,
-    tracked_documents: Arc<std::sync::RwLock<HashSet<String>>>,
+    peer_addresses: Arc<HopscotchMap<String, String, RandomState>>,
+    tracked_documents: Arc<HopscotchMap<String, (), RandomState>>,
     nac_checker: Option<Arc<dyn db::NodeAccessChecker>>,
 }
 
@@ -44,6 +46,20 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
                 .map_err(crate::map_nac_error)?;
         }
         Ok(())
+    }
+
+    /// Whether the caller holds `permission`, as a plain answer rather than an
+    /// error.
+    ///
+    /// Used to resolve an authority that is carried into a state change, not to
+    /// decide whether a call is allowed: a missing permission is a fact about
+    /// the caller here, not a failure. A node with no access control configured
+    /// holds everything, exactly as `check_nac` treats it.
+    async fn holds_nac(&self, permission: acp::nac::NodePermission) -> bool {
+        match self.nac_checker {
+            Some(ref checker) => checker.check_node_access(permission).await.is_ok(),
+            None => true,
+        }
     }
 
     /// True when the transport already holds a live connection to `peer_id`.
@@ -66,13 +82,7 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
     }
 
     async fn resubscribe_tracked_document_topics(&self) {
-        let doc_ids: Vec<String> = match self.tracked_documents.read() {
-            Ok(docs) => docs.iter().cloned().collect(),
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to read tracked documents");
-                return;
-            }
-        };
+        let doc_ids: Vec<String> = self.tracked_documents.keys().collect();
         for doc_id in &doc_ids {
             let topic = DefraTopic::document(doc_id);
             if let Err(error) = self.transport.unsubscribe(topic.clone()).await {
@@ -99,8 +109,8 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
             event_bus: Some(event_bus),
             version_syncer,
             replicator_push_options: ReplicatorPushOptionsState::default(),
-            peer_addresses: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            tracked_documents: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            peer_addresses: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
+            tracked_documents: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
             nac_checker: Some(nac_checker),
         }
     }
@@ -180,10 +190,10 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
         ))
     }
 
-    pub fn set_initial_tracked_documents(&self, docs: HashSet<String>) {
-        if let Ok(mut tracked) = self.tracked_documents.write() {
-            *tracked = docs;
-        }
+    pub fn set_initial_tracked_documents(&self, docs: RapidHashSet<String>) {
+        self.tracked_documents.clear();
+        self.tracked_documents
+            .extend(docs.into_iter().map(|doc_id| (doc_id, ())));
     }
 
     /// Transport-only adapter for tests: no coordinator, pusher, event bus, or
@@ -198,8 +208,8 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
             event_bus: None,
             version_syncer: None,
             replicator_push_options: ReplicatorPushOptionsState::default(),
-            peer_addresses: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            tracked_documents: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            peer_addresses: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
+            tracked_documents: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
             nac_checker: None,
         }
     }
@@ -213,15 +223,49 @@ impl<B: Blockstore + 'static> IrohP2PAdapter<B> {
             None => collections,
         }
     }
+
+    /// Drop every trace of a revoked peer's replication, so nothing dials it
+    /// again on a timer. Mirrors the full-deletion branch of
+    /// `remove_replicator` (all collections, not a subset), plus the durable
+    /// retry record that survives a restart.
+    ///
+    /// Idempotent: a peer that was never a replicator has nothing to delete
+    /// and that is not an error, which matters because revoking a peer that
+    /// never replicated is a perfectly ordinary thing to do.
+    async fn deregister_revoked_replicator(
+        &self,
+        peer_id: &p2p::transport::PeerId,
+    ) -> P2PResult<()> {
+        if let Some(ref coordinator) = self.sync_coordinator {
+            coordinator
+                .delete_replicator(peer_id)
+                .await
+                .map_err(|error| P2PError::transport(error.to_string()))?;
+        } else {
+            self.transport
+                .delete_replicator(peer_id)
+                .await
+                .map_err(|error| P2PError::transport(error.to_string()))?;
+        }
+
+        if let Some(ref pusher) = self.doc_pusher {
+            pusher
+                .delete_persisted_replicator(&peer_id.to_string())
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
     async fn sync_status(&self) -> P2PResult<serde_json::Value> {
         let Some(coordinator) = self.sync_coordinator.as_ref() else {
             return Ok(serde_json::Value::Null);
         };
-        let mut status = serde_json::to_value(coordinator.sync_status())
+        let mut status = serde_json::to_value(coordinator.sync_status().await)
             .map_err(|error| P2PError::transport(error.to_string()))?;
         if let (Some(pusher), Some(object)) = (self.doc_pusher.as_ref(), status.as_object_mut()) {
             object.insert(
@@ -266,11 +310,9 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
         let mut result = Vec::new();
         for peer in &connected {
             let peer_str = peer.to_string();
-            if let Ok(addrs) = self.peer_addresses.read() {
-                if let Some(addr) = addrs.get(&peer_str) {
-                    result.push(addr.clone());
-                    continue;
-                }
+            if let Some(addr) = self.peer_addresses.get(&peer_str) {
+                result.push(addr);
+                continue;
             }
             result.push(peer_str);
         }
@@ -303,9 +345,8 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
         // against a healthy connection and fail the caller. Refresh the
         // address book and return.
         if self.is_transport_connected(&peer_id).await {
-            if let Ok(mut addrs) = self.peer_addresses.write() {
-                addrs.insert(peer_id.to_string(), addr.to_string());
-            }
+            self.peer_addresses
+                .insert(peer_id.to_string(), addr.to_string());
             return Ok(());
         }
 
@@ -315,7 +356,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             std::time::Duration::from_secs(5)
         };
 
-        tokio::time::timeout(dial_timeout, self.transport.dial(&peer_id, direct_addrs))
+        n0_future::time::timeout(dial_timeout, self.transport.dial(&peer_id, direct_addrs))
             .await
             .map_err(|_| {
                 P2PError::transport(format!("failed to connect: timeout dialing {peer_id}"))
@@ -326,9 +367,8 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             .await
             .map_err(|error| P2PError::transport(error.to_string()))?;
 
-        if let Ok(mut addrs) = self.peer_addresses.write() {
-            addrs.insert(peer_id.to_string(), addr.to_string());
-        }
+        self.peer_addresses
+            .insert(peer_id.to_string(), addr.to_string());
         self.resubscribe_tracked_document_topics().await;
 
         Ok(())
@@ -344,22 +384,72 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             .disconnect(&peer_id)
             .await
             .map_err(|error| P2PError::transport(error.to_string()))?;
-        if let Ok(mut addrs) = self.peer_addresses.write() {
-            addrs.remove(&peer_id.to_string());
-        }
+        self.peer_addresses.remove(&peer_id.to_string());
         Ok(())
     }
 
+    /// Authorize a peer, which for a peer that is currently REVOKED means
+    /// reversing a revocation.
+    ///
+    /// Ordinary admission needs `P2pPeerConnect`, as before. Lifting a
+    /// revocation additionally needs `P2pPeerDisconnect`, the permission that
+    /// could have imposed it: otherwise a principal provisioned only to add
+    /// peers could undo a revocation it was never trusted to make, and the
+    /// revocation would only be as strong as the weakest permission anyone
+    /// holds.
+    ///
+    /// The second permission is resolved into an authority and carried down,
+    /// not checked here. Deciding it here and acting on it in the endpoint
+    /// would be a check against state that a concurrent revoke may already
+    /// have changed; the endpoint applies the authority inside the same lock
+    /// as the transition instead.
     async fn allow_peer(&self, peer_id: &TransportPeerId) -> P2PResult<()> {
         self.check_nac(acp::nac::NodePermission::P2pPeerConnect)
+            .await?;
+        let may_revoke = self
+            .holds_nac(acp::nac::NodePermission::P2pPeerDisconnect)
+            .await;
+
+        let peer_id = parse_canonical_peer_id(peer_id.as_str())
+            .map_err(|error| P2PError::invalid_input(error.to_string()))?;
+        self.transport
+            .allow_peer(
+                &peer_id,
+                p2p::iroh::AdmissionAuthority::new(true, may_revoke),
+            )
+            .await
+            .map_err(|error| P2PError::transport(error.to_string()))
+    }
+
+    /// Bar a peer and stop this node reaching for it again.
+    ///
+    /// Two steps, and both are needed. `transport.deny_peer` bars the peer in
+    /// the endpoint and hangs up what it holds, but a peer registered as a
+    /// replicator is also something this node dials on a timer: the reconnect
+    /// sweep dials exactly the registered peers missing from
+    /// `connected_peers`, and hanging up is what makes it missing. Leaving the
+    /// registration in place would mean a barred peer the node keeps trying to
+    /// reach every couple of seconds, forever.
+    ///
+    /// Deregistration is deliberately destructive and is not undone by
+    /// `allow_peer`: re-admitting a device restores its ability to connect,
+    /// not its replication. The replicator has to be added back explicitly.
+    ///
+    /// The bar is applied FIRST so that a failure to deregister still leaves
+    /// the peer barred rather than half-revoked, and the failure is returned
+    /// rather than swallowed.
+    async fn deny_peer(&self, peer_id: &TransportPeerId) -> P2PResult<()> {
+        self.check_nac(acp::nac::NodePermission::P2pPeerDisconnect)
             .await?;
 
         let peer_id = parse_canonical_peer_id(peer_id.as_str())
             .map_err(|error| P2PError::invalid_input(error.to_string()))?;
         self.transport
-            .allow_peer(&peer_id)
+            .deny_peer(&peer_id)
             .await
-            .map_err(|error| P2PError::transport(error.to_string()))
+            .map_err(|error| P2PError::transport(error.to_string()))?;
+
+        self.deregister_revoked_replicator(&peer_id).await
     }
 
     async fn notify_network_change(&self) -> P2PResult<()> {
@@ -454,7 +544,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
                 .validate_replication_filters(&replication_filters)?;
         }
 
-        let requested_collections: HashSet<String> = collection_cids.iter().cloned().collect();
+        let requested_collections: RapidHashSet<String> = collection_cids.iter().cloned().collect();
         let validated_capabilities = crate::validate_explicit_replay_capabilities(
             explicit_replay_capabilities,
             expected_authorizer_did,
@@ -485,7 +575,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
         // skip the expensive initial replay when the replicator already exists
         // with the same collections (idempotent reconnect path).
         let (existing_collection_ids, existing_filters): (
-            HashSet<String>,
+            RapidHashSet<String>,
             p2p::ReplicationFilters,
         ) = {
             let result = if let Some(ref coordinator) = self.sync_coordinator {
@@ -501,14 +591,14 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             };
             match result {
                 Ok(Some(info)) => (info.collections.into_iter().collect(), info.filters),
-                Ok(None) => (HashSet::new(), p2p::ReplicationFilters::new()),
+                Ok(None) => (RapidHashSet::new(), p2p::ReplicationFilters::new()),
                 Err(e) => {
                     tracing::warn!(
                         peer_id = %peer_id,
                         error = %e,
                         "Failed to check existing replicator state; falling back to full replay"
                     );
-                    (HashSet::new(), p2p::ReplicationFilters::new())
+                    (RapidHashSet::new(), p2p::ReplicationFilters::new())
                 }
             }
         };
@@ -526,9 +616,8 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
                 })?;
         }
 
-        if let Ok(mut addrs) = self.peer_addresses.write() {
-            addrs.insert(peer_id.to_string(), addr_str.to_string());
-        }
+        self.peer_addresses
+            .insert(peer_id.to_string(), addr_str.to_string());
 
         let replicator_info = p2p::ReplicatorInfo::from_raw_with_filters(
             peer_id.to_string(),
@@ -559,6 +648,48 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
                 .map_err(|error| P2PError::transport(error.to_string()))?;
         }
 
+        // Re-check the bar now the records exist, and undo them if the peer was
+        // revoked while this was running.
+        //
+        // Registering a replicator is several awaits long (validation, a dial,
+        // a durable write, then the live record), and `deny_peer` is not one
+        // step either: it bars the peer and then deletes its replicator state.
+        // Checking admission only at the start would let a registration that
+        // began before the bar finish after the deletion and put both records
+        // back, leaving a revoked peer registered and the reconnect sweep
+        // dialling it forever.
+        //
+        // Ordering makes the pair safe without a lock, the same way the accept
+        // and dial paths are made safe. `deny_peer` sets the bar BEFORE it
+        // deletes, so either its deletion runs after these creations and
+        // removes them, or the bar was already set when this check reads it and
+        // this removes them. There is no interleaving in which the records
+        // survive.
+        // A failed check counts as revoked, not as permission. This is the
+        // last gate before a peer keeps durable replication state, so the
+        // safe answer to "we could not find out" is to undo the registration
+        // and make the caller retry, not to assume the peer is fine.
+        let revoked = match self.transport.is_peer_revoked(&peer_id).await {
+            Ok(revoked) => revoked,
+            Err(error) => {
+                tracing::warn!(
+                    peer_id = %peer_id,
+                    error = %error,
+                    "could not confirm peer admission after registering its replicator; \
+                     rolling the registration back"
+                );
+                true
+            }
+        };
+        if revoked {
+            self.deregister_revoked_replicator(&peer_id).await?;
+            return Err(P2PError::invalid_input(format!(
+                "peer {peer_id} is not admitted, or its admission could not be confirmed, \
+                 while its replicator was being registered; the registration has been \
+                 rolled back and can be retried"
+            )));
+        }
+
         let collection_names_requiring_replay = crate::collections_requiring_replay(
             &effective_collections,
             &collection_cids,
@@ -584,7 +715,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
                     "Replaying existing docs for collections requiring replay"
                 );
 
-                tokio::spawn(async move {
+                n0_future::task::spawn(async move {
                     if let Err(error) = push_pusher
                         .push_existing_docs(
                             &push_peer,
@@ -783,10 +914,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
         self.check_nac(acp::nac::NodePermission::P2pDocumentList)
             .await?;
 
-        let docs = self.tracked_documents.read().map_err(|error| {
-            P2PError::internal(format!("failed to read tracked documents: {error}"))
-        })?;
-        let mut sorted: Vec<String> = docs.iter().cloned().collect();
+        let mut sorted: Vec<String> = self.tracked_documents.keys().collect();
         sorted.sort();
         Ok(sorted
             .into_iter()
@@ -811,17 +939,11 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             if let Err(error) = self.transport.subscribe(topic).await {
                 tracing::warn!(doc_id = %doc_id, error = %error, "Failed to subscribe to topic for document");
             }
-            if let Ok(mut tracked) = self.tracked_documents.write() {
-                tracked.insert(doc_id.clone());
-            }
+            self.tracked_documents.insert(doc_id.clone(), ());
         }
 
         if let Some(ref pusher) = self.doc_pusher {
-            let all_docs: Vec<String> = self
-                .tracked_documents
-                .read()
-                .map(|docs| docs.iter().cloned().collect())
-                .unwrap_or_default();
+            let all_docs: Vec<String> = self.tracked_documents.keys().collect();
             if let Err(error) = pusher.persist_p2p_documents(&all_docs).await {
                 tracing::warn!(error = %error, "failed to persist P2P documents");
             }
@@ -844,17 +966,11 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             if let Err(error) = self.transport.unsubscribe(topic).await {
                 tracing::warn!(doc_id = %doc_id, error = %error, "Failed to unsubscribe from topic for document");
             }
-            if let Ok(mut tracked) = self.tracked_documents.write() {
-                tracked.remove(doc_id);
-            }
+            self.tracked_documents.remove(doc_id);
         }
 
         if let Some(ref pusher) = self.doc_pusher {
-            let all_docs: Vec<String> = self
-                .tracked_documents
-                .read()
-                .map(|docs| docs.iter().cloned().collect())
-                .unwrap_or_default();
+            let all_docs: Vec<String> = self.tracked_documents.keys().collect();
             if let Err(error) = pusher.persist_p2p_documents(&all_docs).await {
                 tracing::warn!(error = %error, "failed to persist P2P documents after removal");
             }
@@ -913,7 +1029,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             let request_clone = request.clone();
             let transport = self.transport.clone();
             let peer = peer.clone();
-            tokio::spawn(async move {
+            n0_future::task::spawn(async move {
                 if let Err(error) = transport
                     .send_branchable_sync_request(&peer, request_clone)
                     .await
@@ -947,7 +1063,7 @@ impl<B: Blockstore + 'static> P2POperations for IrohP2PAdapter<B> {
             .as_ref()
             .ok_or_else(|| P2PError::unsupported("version syncer required"))?
             .clone();
-        tokio::spawn(async move {
+        n0_future::task::spawn(async move {
             if let Err(error) = syncer.sync_versions(version_ids, connected_peers).await {
                 tracing::warn!(error = %error, "version sync failed");
             }
@@ -993,7 +1109,8 @@ mod tests {
     /// generic is never exercised; a do-nothing implementation satisfies it.
     struct NoopBlockstore;
 
-    #[async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     impl Blockstore for NoopBlockstore {
         async fn get(&self, _cid: &Cid) -> blockstore::Result<Option<Bytes>> {
             Ok(None)
@@ -1158,8 +1275,8 @@ mod tests {
             .await
             .expect("dial reaches endpoint b");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while std::time::Instant::now() < deadline {
+        let deadline = web_time::Instant::now() + std::time::Duration::from_millis(500);
+        while web_time::Instant::now() < deadline {
             let connected = transport_b
                 .connected_peers()
                 .await
@@ -1284,20 +1401,21 @@ mod tests {
             event_bus: Some(Arc::new(events::ChannelBus::default())),
             version_syncer: None,
             replicator_push_options: ReplicatorPushOptionsState::default(),
-            peer_addresses: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            tracked_documents: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            peer_addresses: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
+            tracked_documents: Arc::new(HopscotchMap::with_hasher(RandomState::default())),
             nac_checker: None,
         };
 
         // Endpoint B has no coordinator behind it, so it accepts the doc-sync
         // request at the transport layer and never produces a reply or a merge.
         // Dropping each event drops the reply token with it.
-        let drain_b = tokio::spawn(async move { while events_b.recv().await.is_some() {} });
+        let drain_b =
+            n0_future::task::spawn(async move { while events_b.recv().await.is_some() {} });
 
         let dial_addr = dialable_ticket(&transport_b).await;
         adapter.connect_peer(&dial_addr).await.expect("dial b");
 
-        let result = tokio::time::timeout(
+        let result = n0_future::time::timeout(
             std::time::Duration::from_secs(10),
             adapter.sync_documents("Users", vec!["bae-does-not-matter".to_string()], None),
         )

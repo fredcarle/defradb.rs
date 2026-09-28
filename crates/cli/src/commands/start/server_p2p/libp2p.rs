@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rapidhash::{HashSetExt, RapidHashSet};
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
@@ -188,7 +188,22 @@ impl Node {
         coordinator.spawn_background_task("pending_dag_retry_clock", async move {
             coordinator_for_retry_clock
                 .run_pending_dag_retry_clock(std::time::Duration::from_secs(2))
-                .await;
+                .await
+                .expect("retry interval is nonzero");
+        });
+
+        // The fallback for a deferred verdict no arrival can release: one
+        // named nothing, one past the index's capacity, and everything the
+        // index held before this process started.
+        let sweep_handler = replication.merge_handler_inner.clone();
+        let sweep_shutdown = coordinator.shutdown_handle();
+        coordinator.spawn_background_task("governance_sweep", async move {
+            db::merge::governance::run_governance_sweep(
+                sweep_handler,
+                db::merge::governance::SWEEP_INTERVAL,
+                sweep_shutdown,
+            )
+            .await;
         });
 
         let coordinator_for_events = coordinator.clone();
@@ -378,6 +393,9 @@ impl Node {
         );
         let se_repusher: Arc<dyn db::merge::SeArtifactRepusher> =
             replication.broadcast_mutator.clone();
+        replication
+            .merge_handler_inner
+            .set_se_repusher(se_repusher.clone());
         let retry_loop_task = defra_p2p_adapter::spawn_retry_loop(
             storage::stores::Peerstore::new(store.clone()).with_retry_schedule(retry_schedule),
             p2p::Libp2pTransport::new(handle.clone()),
@@ -406,7 +424,7 @@ impl Node {
             }
         }
 
-        let mut restored_doc_ids = HashSet::new();
+        let mut restored_doc_ids = RapidHashSet::new();
         if let Ok(doc_ids) = restore_peerstore.load_documents().await {
             for doc_id in &doc_ids {
                 let _ = handle
@@ -453,7 +471,7 @@ impl Node {
 
         Ok(P2PSetup {
             host_handle: Some(handle),
-            p2p_tasks: Some(P2PTasks {
+            p2p_tasks: Some(P2PTasks::Libp2p {
                 coordinator: coordinator.shutdown_handle(),
                 host_task,
                 replication_task,
@@ -474,7 +492,7 @@ impl Node {
                 // detached P2P broadcast fires (#976). Without this, the
                 // mutator's pre-broadcast registration is skipped (ACP handle
                 // absent) and an encrypted doc's DEK can leak during the
-                // ~4.5s SourceHub registration window.
+                // ~4.5s Vera registration window.
                 broadcast_mutator_for_acp.set_document_acp(acp.clone());
                 merge_handler_for_acp.set_document_acp(acp);
             })),

@@ -21,26 +21,11 @@ enum CollectionMergeFrame {
 
 impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
     fn has_merged_collection(&self, cid: &Cid) -> bool {
-        self.merged_collections
-            .lock()
-            .unwrap_or_else(|error| {
-                tracing::warn!("merged_collections lock poisoned, recovering");
-                error.into_inner()
-            })
-            .contains(cid)
+        self.merged_collections.contains_key(cid)
     }
 
-    fn has_batch_merged_collection(
-        batch_merged_collections: &std::sync::Mutex<HashSet<Cid>>,
-        cid: &Cid,
-    ) -> bool {
-        batch_merged_collections
-            .lock()
-            .unwrap_or_else(|error| {
-                tracing::warn!("batch_merged_collections lock poisoned, recovering");
-                error.into_inner()
-            })
-            .contains(cid)
+    fn has_batch_merged_collection(batch_merged_collections: &CidSet, cid: &Cid) -> bool {
+        batch_merged_collections.contains_key(cid)
     }
 
     async fn load_parent_collection(&self, parent_cid: &Cid, child_cid: &Cid) -> Option<Block> {
@@ -190,7 +175,9 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                         continue;
                     }
                     let outcome = match self
-                        .process_collection_delta_body(&cid, &block, &payload, metadata, depth)
+                        .process_collection_delta_body(
+                            &cid, &block, &payload, metadata, depth, is_root,
+                        )
                         .await
                     {
                         Ok(outcome) => outcome,
@@ -214,6 +201,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
         Ok(MergeOutcome::terminal_skip("collection already merged"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_collection_delta_body(
         &self,
         cid: &Cid,
@@ -221,10 +209,15 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
         payload: &defra_core::block::CollectionDeltaPayload,
         metadata: &BlockMetadata<'_>,
         depth: usize,
+        is_root: bool,
     ) -> std::result::Result<MergeOutcome, MergeError> {
         // Process linked document composites
         let mut any_merged = false;
         let mut retryable_skip: Option<MergeOutcome> = None;
+        // A link this node could not process, where processing it later could
+        // still succeed. The head must not be written and the block must not
+        // be discharged while one is outstanding.
+        let mut unprocessed: Option<String> = None;
         if let Some(links) = &block.links {
             for dag_link in links {
                 let link_cid = &dag_link.link;
@@ -243,6 +236,8 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                             link_cid = %link_cid,
                             "Linked block not found in blockstore"
                         );
+                        unprocessed
+                            .get_or_insert_with(|| format!("linked block {link_cid} not held"));
                         continue;
                     }
                     Err(e) => {
@@ -251,6 +246,9 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                             error = %e,
                             "Failed to load linked block"
                         );
+                        unprocessed.get_or_insert_with(|| {
+                            format!("linked block {link_cid} could not be loaded: {e}")
+                        });
                         continue;
                     }
                 };
@@ -344,6 +342,11 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                             }
                             Err(e) => {
                                 tracing::debug!(link_cid = %link_cid, error = %e, "Composite merge failed");
+                                if e.disposition() == MergeErrorDisposition::Retryable {
+                                    unprocessed.get_or_insert_with(|| {
+                                        format!("linked composite {link_cid} failed: {e}")
+                                    });
+                                }
                             }
                         }
                     }
@@ -360,6 +363,38 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
 
         if let Some(outcome) = retryable_skip {
             return Ok(outcome);
+        }
+
+        // A head names this collection's verifiable history. Writing one while
+        // a link is still unprocessed would claim history this node does not
+        // hold, and the terminal skip below would discharge the block so the
+        // document it named is never merged and never retried.
+        //
+        // Only the root is gated. Replication discharges the root, so the
+        // root's completeness is what the discharge must reflect; an ancestor
+        // is walked as context, and a partial DAG is an ordinary condition on
+        // the receive path, where a CAR is truncated at its block and byte
+        // caps. Aborting a root because a historical block is incomplete would
+        // stall deep catch-up entirely. The walk already tolerates an
+        // ancestor's hard errors for the same reason.
+        if let Some(reason) = unprocessed {
+            if is_root {
+                return Ok(MergeOutcome::retryable_skip(reason));
+            }
+            tracing::debug!(
+                %cid,
+                reason,
+                "Ancestor collection block has an unprocessed link; continuing the walk"
+            );
+            // The ancestor records nothing, or the Enter guard's
+            // already-merged skip discharges it on a later attempt before
+            // the missing link arrives, and that link is never merged. The
+            // walk still continues: this outcome is what the frame loop
+            // treats as finished for a non-root frame.
+            if any_merged {
+                return Ok(MergeOutcome::Merged);
+            }
+            return Ok(MergeOutcome::terminal_skip(reason));
         }
 
         // Update collection headstore using proper head merging.
@@ -431,13 +466,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
             "Collection delta processed"
         );
 
-        {
-            let mut merged = self.merged_collections.lock().unwrap_or_else(|e| {
-                tracing::warn!("merged_collections lock poisoned, recovering");
-                e.into_inner()
-            });
-            merged.insert(*cid);
-        }
+        self.merged_collections.insert(*cid, ());
 
         if any_merged {
             Ok(MergeOutcome::Merged)
@@ -462,11 +491,11 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
         block: &Block,
         payload: &defra_core::block::CollectionDeltaPayload,
         metadata: &BlockMetadata<'_>,
-        batch_merged: &std::sync::Mutex<HashSet<Cid>>,
-        batch_merged_collections: &std::sync::Mutex<HashSet<Cid>>,
-        pending_events: &std::sync::Mutex<Vec<PendingMergeEvent>>,
-        pending_post_commit_actions: &std::sync::Mutex<Vec<PendingPostCommitAction>>,
-        pending_field_block_finalizations: &std::sync::Mutex<Vec<PendingFieldBlockFinalization>>,
+        batch_merged: &CidSet,
+        batch_merged_collections: &CidSet,
+        pending_events: &SegQueue<PendingMergeEvent>,
+        pending_post_commit_actions: &SegQueue<PendingPostCommitAction>,
+        pending_field_block_finalizations: &SegQueue<PendingFieldBlockFinalization>,
         depth: usize,
     ) -> std::result::Result<MergeOutcome, MergeError> {
         let mut frames = vec![CollectionMergeFrame::Enter {
@@ -596,6 +625,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                             pending_post_commit_actions,
                             pending_field_block_finalizations,
                             depth,
+                            is_root,
                         )
                         .await
                     {
@@ -630,23 +660,37 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
         block: &Block,
         payload: &defra_core::block::CollectionDeltaPayload,
         metadata: &BlockMetadata<'_>,
-        batch_merged: &std::sync::Mutex<HashSet<Cid>>,
-        batch_merged_collections: &std::sync::Mutex<HashSet<Cid>>,
-        pending_events: &std::sync::Mutex<Vec<PendingMergeEvent>>,
-        pending_post_commit_actions: &std::sync::Mutex<Vec<PendingPostCommitAction>>,
-        pending_field_block_finalizations: &std::sync::Mutex<Vec<PendingFieldBlockFinalization>>,
+        batch_merged: &CidSet,
+        batch_merged_collections: &CidSet,
+        pending_events: &SegQueue<PendingMergeEvent>,
+        pending_post_commit_actions: &SegQueue<PendingPostCommitAction>,
+        pending_field_block_finalizations: &SegQueue<PendingFieldBlockFinalization>,
         depth: usize,
+        is_root: bool,
     ) -> std::result::Result<MergeOutcome, MergeError> {
         // Process linked document composites
         let mut any_merged = false;
         let mut retryable_skip: Option<MergeOutcome> = None;
+        // See the non-batch path: a link that could not be processed, but
+        // might be processable later, blocks both the head and the discharge.
+        let mut unprocessed: Option<String> = None;
         if let Some(links) = &block.links {
             for dag_link in links {
                 let link_cid = &dag_link.link;
 
                 let linked_data = match self.blockstore.get(link_cid).await {
                     Ok(Some(data)) => data,
-                    _ => continue,
+                    Ok(None) => {
+                        unprocessed
+                            .get_or_insert_with(|| format!("linked block {link_cid} not held"));
+                        continue;
+                    }
+                    Err(e) => {
+                        unprocessed.get_or_insert_with(|| {
+                            format!("linked block {link_cid} could not be loaded: {e}")
+                        });
+                        continue;
+                    }
                 };
 
                 let linked_block = match Block::from_dag_cbor(&linked_data) {
@@ -684,8 +728,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                                 .collection_id
                                 .unwrap_or(&payload.schema_version_id)
                                 .to_string();
-                            let mut pe = pending_events.lock().unwrap();
-                            pe.push(PendingMergeEvent {
+                            pending_events.push(PendingMergeEvent {
                                 message: Message::merge_complete(MergeCompleteData {
                                     doc_id: doc_id_str,
                                     subject_doc_id: None,
@@ -701,11 +744,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                                 .collection_id
                                 .unwrap_or(&payload.schema_version_id)
                                 .to_string();
-                            let mut pe = pending_events.lock().unwrap_or_else(|e| {
-                                tracing::warn!("pending_events lock poisoned, recovering");
-                                e.into_inner()
-                            });
-                            pe.push(PendingMergeEvent {
+                            pending_events.push(PendingMergeEvent {
                                 message: Message::merge_complete(MergeCompleteData {
                                     doc_id: doc_id_str,
                                     subject_doc_id: None,
@@ -721,6 +760,11 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
                         }
                         Err(e) => {
                             tracing::debug!(link_cid = %link_cid, error = %e, "Composite merge failed in batch");
+                            if e.disposition() == MergeErrorDisposition::Retryable {
+                                unprocessed.get_or_insert_with(|| {
+                                    format!("linked composite {link_cid} failed: {e}")
+                                });
+                            }
                         }
                     }
                 }
@@ -729,6 +773,24 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
 
         if let Some(outcome) = retryable_skip {
             return Ok(outcome);
+        }
+
+        if let Some(reason) = unprocessed {
+            if is_root {
+                return Ok(MergeOutcome::retryable_skip(reason));
+            }
+            tracing::debug!(
+                %cid,
+                reason,
+                "Ancestor collection block has an unprocessed link; continuing the walk"
+            );
+            // As in the single-block walk: an unprocessed ancestor writes no
+            // head and marks nothing merged, so the root's later retry can
+            // still walk it once the missing link has arrived.
+            if any_merged {
+                return Ok(MergeOutcome::Merged);
+            }
+            return Ok(MergeOutcome::terminal_skip(reason));
         }
 
         // Update collection headstore using the shared headstore view
@@ -750,13 +812,7 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
             short_id
         };
 
-        {
-            let mut batch_merged_guard = batch_merged_collections.lock().unwrap_or_else(|e| {
-                tracing::warn!("batch_merged_collections lock poisoned, recovering");
-                e.into_inner()
-            });
-            batch_merged_guard.insert(*cid);
-        }
+        batch_merged_collections.insert(*cid, ());
 
         {
             if let Some(heads) = &block.heads {

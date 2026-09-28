@@ -48,6 +48,16 @@ impl<S: Store> crate::database::DB<S> {
                 })?;
             crate::collection::populate_collection_root_id(&systemstore, &mut target_schema)
                 .await?;
+            // A synced version binds its policy by CID. Rebuilt without the
+            // reference, the record commits to less than its identity does,
+            // and activating it would serve the collection unpoliced,
+            // indistinguishable from one that never had a policy.
+            if let (None, Some(policy_cid)) = (&target_schema.policy, &target_schema.policy_cid) {
+                return Err(Error::CollectionVersionPolicyNotHeld {
+                    version_id: version_id.to_string(),
+                    policy_cid: policy_cid.clone(),
+                });
+            }
 
             let name = target_schema.name.clone();
             let collection_id = target_schema.collection_id.clone();
@@ -115,19 +125,16 @@ impl<S: Store> crate::database::DB<S> {
         };
 
         txn.commit().await?;
+        let collection = self
+            .collection_with_index_actions(target_schema.clone())
+            .await?;
 
         // Update the process-wide cache (scoped to drop lock before reindex)
-        {
-            let mut cache = self.collections.write().map_err(|e| {
-                tracing::error!(
-                    error = ?e,
-                    version_id = %version_id,
-                    "Collection cache lock poisoned during set_active_collection_version"
-                );
-                Error::CacheUpdateFailedAfterCommit(name.clone())
-            })?;
-            cache.insert(name.clone(), Collection::new(target_schema));
-        }
+        self.collections.rcu(|old| {
+            let mut cache = old.clone();
+            cache.put_named(name.as_str(), collection.clone());
+            cache
+        });
 
         tracing::info!(
             collection_name = %name,
@@ -147,20 +154,9 @@ impl<S: Store> crate::database::DB<S> {
     /// This searches the in-memory cache for a collection with the given version ID.
     /// It only returns active collections that are in the cache.
     pub fn get_collection_by_version_id(&self, version_id: &str) -> Result<Option<Collection>> {
-        let cache = self.collections.read().map_err(|e| {
-            tracing::error!(
-                error = ?e,
-                version_id = %version_id,
-                "Collection cache lock poisoned during get_collection_by_version_id"
-            );
-            Error::LockPoisoned(
-                "collection cache lock poisoned during get_collection_by_version_id".into(),
-            )
-        })?;
-        Ok(cache
-            .values()
-            .find(|c| c.version_id() == version_id)
-            .cloned())
+        Ok(self
+            .collections
+            .peek(|cache| cache.by_version(version_id).cloned()))
     }
 
     /// Get a collection by version ID, searching both cache and KV store.
@@ -286,7 +282,7 @@ impl<S: Store> crate::database::DB<S> {
                 }
             }
         }
-        let mut deleting_versions: std::collections::HashSet<&str> =
+        let mut deleting_versions: rapidhash::RapidHashSet<&str> =
             also_deleting.iter().map(String::as_str).collect();
         deleting_versions.insert(version_id);
         let is_deleting_last_local_version = all_versions.iter().all(|version| {
@@ -354,9 +350,11 @@ impl<S: Store> crate::database::DB<S> {
 
         // 5. Remove from in-memory cache if active
         if target_schema.is_active {
-            if let Ok(mut cache) = self.collections.write() {
+            self.collections.rcu(|old| {
+                let mut cache = old.clone();
                 cache.remove(&name);
-            }
+                cache
+            });
         }
         if is_deleting_last_local_version {
             self.forbid_collection_id(&collection_id)?;
@@ -386,11 +384,11 @@ impl<S: Store> crate::database::DB<S> {
         // Sort topologically: children before parents
         // A child has a PreviousVersion pointing to a parent in the batch
         let all_versions = self.get_all_collection_versions().await?;
-        let version_map: std::collections::HashMap<&str, &CollectionVersion> = all_versions
+        let version_map: rapidhash::RapidHashMap<&str, &CollectionVersion> = all_versions
             .iter()
             .map(|v| (v.version_id.as_str(), v))
             .collect();
-        let deleting_versions: std::collections::HashSet<&str> =
+        let deleting_versions: rapidhash::RapidHashSet<&str> =
             version_ids.iter().map(String::as_str).collect();
 
         for version_id in &version_ids {
@@ -426,7 +424,7 @@ impl<S: Store> crate::database::DB<S> {
             }
         }
 
-        let removed_collection_ids: std::collections::HashSet<&str> = all_versions
+        let removed_collection_ids: rapidhash::RapidHashSet<&str> = all_versions
             .iter()
             .filter(|version| {
                 deleting_versions.contains(version.version_id.as_str())
@@ -453,8 +451,7 @@ impl<S: Store> crate::database::DB<S> {
         }
 
         let mut sorted = Vec::with_capacity(version_ids.len());
-        let mut remaining: std::collections::HashSet<String> =
-            version_ids.iter().cloned().collect();
+        let mut remaining: rapidhash::RapidHashSet<String> = version_ids.iter().cloned().collect();
 
         // Simple topological sort: repeatedly find versions whose children
         // (within the batch) have already been added to sorted
