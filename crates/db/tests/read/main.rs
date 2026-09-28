@@ -6,6 +6,7 @@ mod autocommit_suite;
 mod commits_suite;
 mod counting;
 mod index_composite_in_order;
+mod index_selectivity;
 mod lensed_autocommit_stream_suite;
 mod lensed_autocommit_suite;
 mod lensed_fetcher_suite;

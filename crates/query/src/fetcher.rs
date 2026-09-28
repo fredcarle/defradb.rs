@@ -277,6 +277,22 @@ pub trait DocFetcher: MaybeSendSync {
         false
     }
 
+    /// Count the index entries `params` would visit, stopping at `cap`.
+    ///
+    /// Index selection uses this to prefer the most selective usable index.
+    /// The count ignores limit, offset, cursor, and value filters, so it is an
+    /// upper bound on the scan's matches. `None` means this fetcher cannot
+    /// estimate, and selection falls back to the filter's shape alone.
+    async fn estimate_index_scan(
+        &self,
+        collection_name: &str,
+        params: &IndexScanParams,
+        cap: u64,
+    ) -> Result<Option<u64>> {
+        let _ = (collection_name, params, cap);
+        Ok(None)
+    }
+
     /// Nearest documents to `query_vector` under a vector index, nearest first.
     ///
     /// Returns document short ids, which is what a scan can be narrowed by.

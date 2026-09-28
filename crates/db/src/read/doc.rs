@@ -554,6 +554,28 @@ impl<S: Store + 'static> DocFetcher for DbDocFetcher<S> {
         true
     }
 
+    async fn estimate_index_scan(
+        &self,
+        collection_name: &str,
+        params: &IndexScanParams,
+        cap: u64,
+    ) -> query::error::Result<Option<u64>> {
+        let (_, datastore, _, index_manager) =
+            get_collection_with_index_manager(&self.txn, collection_name).await?;
+        let Some(index) = index_manager.get_index(&params.index_name) else {
+            return Ok(None);
+        };
+        let count = crate::read::index_count::count_index_scan(
+            index,
+            &datastore,
+            &params.scan_type,
+            usize::try_from(cap).unwrap_or(usize::MAX),
+        )
+        .await
+        .map_err(|e| query::error::QueryError::execution(format!("index count error: {}", e)))?;
+        Ok(Some(count as u64))
+    }
+
     async fn get_document_at_cid(
         &self,
         cid: &str,

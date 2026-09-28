@@ -154,6 +154,16 @@ impl<S: Store + 'static> DocFetcher for LensedAutoCommitFetcher<S> {
         true
     }
 
+    async fn estimate_index_scan(
+        &self,
+        collection_name: &str,
+        params: &IndexScanParams,
+        cap: u64,
+    ) -> query::error::Result<Option<u64>> {
+        self.estimate_index_scan_inner(collection_name, params, cap)
+            .await
+    }
+
     async fn vector_search(
         &self,
         collection_name: &str,

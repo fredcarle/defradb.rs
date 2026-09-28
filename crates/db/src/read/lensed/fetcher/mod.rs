@@ -317,6 +317,16 @@ impl<S: Store + 'static> DocFetcher for LensedDocFetcher<S> {
         true
     }
 
+    async fn estimate_index_scan(
+        &self,
+        collection_name: &str,
+        params: &query::planner::index_selection::IndexScanParams,
+        cap: u64,
+    ) -> query::error::Result<Option<u64>> {
+        self.estimate_index_scan_inner(collection_name, params, cap)
+            .await
+    }
+
     async fn vector_search(
         &self,
         collection_name: &str,

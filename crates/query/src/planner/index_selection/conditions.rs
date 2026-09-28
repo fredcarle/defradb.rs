@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 
 use crate::mapper::{Filter, FilterOp, OrderBy, OrderDirection};
 
+use super::estimate::IndexEstimates;
 use super::types::{ConditionValue, FieldCondition};
 
 /// Determines if a filter condition should force a fallback to full scan instead of using the index.
@@ -268,24 +269,50 @@ pub fn can_be_ordered_by_index(order_by: &OrderBy, index: &IndexDescription) -> 
 
 /// Select the best index for a filter from available indexes.
 ///
-/// Returns the index that can most efficiently evaluate the filter.
+/// Returns the index that can most efficiently evaluate the filter, judged by
+/// the filter's shape alone.
 pub fn select_best_index<'a>(
     filter: &Filter,
     indexes: &'a [IndexDescription],
 ) -> Option<&'a IndexDescription> {
-    let mut best_index: Option<&IndexDescription> = None;
-    let mut best_score = 0;
+    select_best_index_with_estimates(filter, indexes, &IndexEstimates::default())
+}
 
-    for index in indexes {
-        if let Some(score) = score_index_for_filter(filter, index) {
-            if score > best_score {
-                best_score = score;
-                best_index = Some(index);
+/// Select the best index for a filter, preferring the fewest estimated entries.
+///
+/// When every usable index has an entry count in `estimates`, the index with
+/// the smallest count wins, so a condition on a selective field beats an
+/// equality on a field that most documents share. Ties, and any usable index
+/// without a count, fall back to the shape score.
+pub fn select_best_index_with_estimates<'a>(
+    filter: &Filter,
+    indexes: &'a [IndexDescription],
+    estimates: &IndexEstimates,
+) -> Option<&'a IndexDescription> {
+    let candidates: Vec<(&IndexDescription, u32)> = indexes
+        .iter()
+        .filter_map(|index| score_index_for_filter(filter, index).map(|score| (index, score)))
+        .collect();
+    let counted = candidates.len() > 1
+        && candidates
+            .iter()
+            .all(|(index, _)| estimates.contains_key(&index.name));
+
+    let mut best: Option<(&IndexDescription, u32)> = None;
+    for (index, score) in candidates {
+        let better = match best {
+            None => true,
+            Some((current, current_score)) if counted => {
+                let (count, current_count) = (estimates[&index.name], estimates[&current.name]);
+                count < current_count || (count == current_count && score > current_score)
             }
+            Some((_, current_score)) => score > current_score,
+        };
+        if better {
+            best = Some((index, score));
         }
     }
-
-    best_index
+    best.map(|(index, _)| index)
 }
 
 /// Score an index for a filter (higher is better).
