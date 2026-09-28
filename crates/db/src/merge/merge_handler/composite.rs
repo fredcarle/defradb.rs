@@ -143,6 +143,14 @@ impl<S: Store, B: blockstore::Blockstore> DbMergeHandler<S, B> {
             ),
             None => None,
         };
+        let _arrival_guard = match collection.as_ref() {
+            Some(collection) => Some(
+                self.merge_queue
+                    .acquire_arrival(collection.collection_id())
+                    .await,
+            ),
+            None => None,
+        };
         let _guard = self.merge_queue.acquire(&doc_id_str).await;
 
         self.process_composite_delta_locked(

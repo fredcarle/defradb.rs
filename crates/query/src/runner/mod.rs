@@ -20,6 +20,7 @@
 //! - `explain`: Explain query execution
 //! - `commits`: Commits query handling
 
+mod arrivals;
 mod commits;
 mod commits_height;
 mod commits_numeric;

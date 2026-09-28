@@ -152,6 +152,38 @@ pub fn build_introspection_schema(
         );
     }
 
+    let arrival = Object::new("DocumentArrival")
+        .field(Field::new("cursor", TypeRef::named_nn("String"), |_| {
+            FieldFuture::new(async { Ok(Some(GqlValue::Null)) })
+        }))
+        .field(Field::new("docID", TypeRef::named_nn("ID"), |_| {
+            FieldFuture::new(async { Ok(Some(GqlValue::Null)) })
+        }));
+    let arrival_page = Object::new("DocumentArrivalPage")
+        .field(Field::new("head", TypeRef::named_nn("String"), |_| {
+            FieldFuture::new(async { Ok(Some(GqlValue::Null)) })
+        }))
+        .field(Field::new("next", TypeRef::named_nn("String"), |_| {
+            FieldFuture::new(async { Ok(Some(GqlValue::Null)) })
+        }))
+        .field(Field::new(
+            "entries",
+            TypeRef::named_nn_list_nn("DocumentArrival"),
+            |_| FieldFuture::new(async { Ok(Some(GqlValue::List(vec![]))) }),
+        ));
+    schema_builder = schema_builder.register(arrival).register(arrival_page);
+    query_type = query_type.field(
+        Field::new(
+            "_documentArrivals",
+            TypeRef::named_nn("DocumentArrivalPage"),
+            |_| FieldFuture::new(async { Ok(Some(GqlValue::Null)) }),
+        )
+        .argument(InputValue::new("collection", TypeRef::named_nn("String")))
+        .argument(InputValue::new("after", TypeRef::named("String")))
+        .argument(InputValue::new("limit", TypeRef::named("Int")))
+        .argument(InputValue::new("docID", TypeRef::named_nn_list("ID"))),
+    );
+
     // Register Commit type and supporting types
     schema_builder = schema_builder
         .register(build_commit_type())

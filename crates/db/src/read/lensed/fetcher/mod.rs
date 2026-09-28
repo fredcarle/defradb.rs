@@ -236,6 +236,19 @@ impl<S: Store + 'static> DocFetcher for LensedDocFetcher<S> {
             .await
     }
 
+    async fn get_document_arrivals(
+        &self,
+        options: &query::fetcher::DocumentArrivalOptions,
+    ) -> query::error::Result<query::fetcher::DocumentArrivalPage> {
+        let mut guard = self.txn.lock().await;
+        let txn = guard
+            .as_mut()
+            .ok_or_else(|| query::error::QueryError::execution("transaction no longer active"))?;
+        crate::event::arrivals::read(txn, options)
+            .await
+            .map_err(|e| query::error::QueryError::execution(e.to_string()))
+    }
+
     async fn get_commits(
         &self,
         options: &query::fetcher::CommitsQueryOptions,
