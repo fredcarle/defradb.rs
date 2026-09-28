@@ -11,6 +11,7 @@ use crate::document::{documents_to_plan_docs, DocumentMapping};
 use crate::error::{QueryError, Result};
 use crate::executor::GqlWarning;
 use crate::mapper::{Requestable, Select};
+use crate::planner::index_selection::estimate_select;
 use crate::planner::{Doc, Planner};
 use crate::txn::TransactionRegistry;
 
@@ -341,6 +342,10 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         };
 
         // Execute with the planner to get filtered documents
+        let index_estimates = match collections_map.get(&filter_select.collection_name) {
+            Some(collection) => estimate_select(fetcher, collection, &filter_select).await?,
+            None => None,
+        };
         let fetcher_arc = FetcherWrapper::new(fetcher);
         let collections: Vec<CollectionVersion> =
             collections_map.values().map(|c| (**c).clone()).collect();
@@ -349,7 +354,8 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
             .with_query_limits(self.query_limits)
             .with_fetcher(Arc::new(fetcher_arc))
             .with_acp(self.acp.clone(), identity)
-            .with_read_validator(self.read_validator.clone());
+            .with_read_validator(self.read_validator.clone())
+            .with_index_estimates(index_estimates);
         if let Some(ref lens_store) = self.lens_store {
             planner = planner.with_lens_store(lens_store.clone());
         }

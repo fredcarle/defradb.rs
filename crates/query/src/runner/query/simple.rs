@@ -11,7 +11,9 @@ use tracing::{debug, warn};
 use crate::document::documents_to_plan_docs;
 use crate::error::Result;
 use crate::mapper::Select;
-use crate::planner::index_selection::{filter_to_index_scan, select_best_index};
+use crate::planner::index_selection::{
+    estimate_select, filter_to_index_scan, select_best_index_with_estimates, IndexEstimates,
+};
 use crate::txn::TransactionRegistry;
 
 use super::super::fetcher::FetcherWrapper;
@@ -64,7 +66,13 @@ impl<F: DocFetcher + 'static, R: TransactionRegistry> QueryRunner<F, R> {
         } else if let Some(ref filter) = select.filter {
             // Try to use an index if available
             if fetcher.supports_index_queries() && !collection.indexes.is_empty() {
-                if let Some(best_index) = select_best_index(filter, &collection.indexes) {
+                let estimates = estimate_select(fetcher, collection, select)
+                    .await?
+                    .map(|estimates| estimates.estimates)
+                    .unwrap_or_else(IndexEstimates::default);
+                if let Some(best_index) =
+                    select_best_index_with_estimates(filter, &collection.indexes, &estimates)
+                {
                     // Extract limit/offset for index optimization
                     let limit = select.limit.as_ref().and_then(|l| l.limit);
                     let offset = select.limit.as_ref().map(|l| l.offset).unwrap_or(0);
