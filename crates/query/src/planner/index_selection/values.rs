@@ -127,13 +127,22 @@ fn normalize_value_for_field(value: NormalValue, field_kind: &FieldKind) -> Norm
         (NormalValue::Int(i), Some(ScalarKind::Float32)) => NormalValue::Float32(*i as f32),
         // Int → Float64 when schema says Float64
         (NormalValue::Int(i), Some(ScalarKind::Float64)) => NormalValue::Float64(*i as f64),
-        // RFC3339 string → Time when schema says DateTime; a String field
-        // indexes the string itself, whatever it looks like
-        (NormalValue::String(s), Some(ScalarKind::DateTime)) => {
+        // RFC3339 string → Time when the field, or its array's elements, is
+        // DateTime; a String field indexes the string itself, whatever it
+        // looks like
+        (NormalValue::String(s), _) if indexes_datetime(field_kind) => {
             chrono::DateTime::parse_from_rfc3339(s).map_or(value, NormalValue::Time)
         }
         _ => value,
     }
+}
+
+fn indexes_datetime(field_kind: &FieldKind) -> bool {
+    field_kind
+        .as_scalar()
+        .or_else(|| field_kind.as_scalar_array().map(|kind| kind.element_kind()))
+        .map(ScalarKind::base_kind)
+        == Some(ScalarKind::DateTime)
 }
 
 /// Normalize a NormalValue for a named index field using collection field metadata.

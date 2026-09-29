@@ -51,6 +51,7 @@ async fn seeded_db() -> Arc<DB<RegolithStore>> {
             FieldDescription::new("2", "owner", FieldKind::string()),
             FieldDescription::new("3", "created_at", FieldKind::string()),
             FieldDescription::new("4", "observed_at", FieldKind::datetime()),
+            FieldDescription::new("5", "seen_at", FieldKind::datetime_array()),
         ],
     );
     version.is_materialized = true;
@@ -58,6 +59,7 @@ async fn seeded_db() -> Arc<DB<RegolithStore>> {
         index(1, "owner"),
         index(2, "created_at"),
         index(3, "observed_at"),
+        index(4, "seen_at"),
     ];
     let db = Arc::new(DB::new(RegolithStore::in_memory().unwrap()).unwrap());
     db.create_collection(version).await.unwrap();
@@ -67,10 +69,9 @@ async fn seeded_db() -> Arc<DB<RegolithStore>> {
             let mut doc = Document::new();
             doc.set("owner", NormalValue::String("alice".to_string()));
             doc.set("created_at", NormalValue::String((*stamp).to_string()));
-            doc.set(
-                "observed_at",
-                NormalValue::Time(chrono::DateTime::parse_from_rfc3339(stamp).unwrap()),
-            );
+            let time = chrono::DateTime::parse_from_rfc3339(stamp).unwrap();
+            doc.set("observed_at", NormalValue::Time(time));
+            doc.set("seen_at", NormalValue::TimeArray(vec![time]));
             doc
         })
         .collect();
@@ -135,6 +136,15 @@ async fn a_range_of_rfc3339_text_uses_the_datetime_index() {
     );
     assert_eq!(
         stamps_matching(&db, r#"{observed_at: {_eq: "2026-09-29T04:20:21Z"}}"#).await,
+        vec![STAMPS[1]]
+    );
+}
+
+#[tokio::test]
+async fn an_element_of_rfc3339_text_uses_the_datetime_array_index() {
+    let db = seeded_db().await;
+    assert_eq!(
+        stamps_matching(&db, r#"{seen_at: {_any: {_eq: "2026-09-29T04:20:21Z"}}}"#).await,
         vec![STAMPS[1]]
     );
 }
