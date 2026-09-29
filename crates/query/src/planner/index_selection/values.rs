@@ -5,6 +5,9 @@ use schema::{FieldDescription, FieldKind, ScalarKind};
 use serde_json::Value as JsonValue;
 
 /// Convert JSON value to NormalValue.
+///
+/// A string stays a string: whether it denotes a `DateTime` depends on the
+/// field it is compared with, which `normalize_for_index_field` decides.
 pub(crate) fn json_to_normal_value(value: &JsonValue) -> Option<NormalValue> {
     match value {
         JsonValue::Null => Some(NormalValue::Null),
@@ -13,13 +16,7 @@ pub(crate) fn json_to_normal_value(value: &JsonValue) -> Option<NormalValue> {
             .as_i64()
             .map(NormalValue::Int)
             .or_else(|| n.as_f64().map(NormalValue::Float64)),
-        JsonValue::String(s) => {
-            // Try to parse as DateTime first (RFC3339/ISO8601)
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-                return Some(NormalValue::Time(dt));
-            }
-            Some(NormalValue::String(s.clone()))
-        }
+        JsonValue::String(s) => Some(NormalValue::String(s.clone())),
         _ => None,
     }
 }
@@ -130,6 +127,11 @@ fn normalize_value_for_field(value: NormalValue, field_kind: &FieldKind) -> Norm
         (NormalValue::Int(i), Some(ScalarKind::Float32)) => NormalValue::Float32(*i as f32),
         // Int → Float64 when schema says Float64
         (NormalValue::Int(i), Some(ScalarKind::Float64)) => NormalValue::Float64(*i as f64),
+        // RFC3339 string → Time when schema says DateTime; a String field
+        // indexes the string itself, whatever it looks like
+        (NormalValue::String(s), Some(ScalarKind::DateTime)) => {
+            chrono::DateTime::parse_from_rfc3339(s).map_or(value, NormalValue::Time)
+        }
         _ => value,
     }
 }
