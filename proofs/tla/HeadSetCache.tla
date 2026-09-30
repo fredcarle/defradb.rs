@@ -143,6 +143,7 @@ CacheNext ==
   \/ CacheEvict
 CacheSpec == CacheInit /\ [][CacheNext]_cacheVars
 
+INV_EpochSnapshot == \A w \in snapshotted : txnEpoch[w] = epoch => txnStore[w] = Current
 INV_CacheExact == resident => cached = Current
 INV_CapturedCacheExact == \A w \in snapshotted : txnWarm[w] => txnCached[w] = txnStore[w]
 INV_CacheReadExact == checked => readActual = readExpected
