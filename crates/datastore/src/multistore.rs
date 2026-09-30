@@ -83,6 +83,29 @@ impl SharedTxn {
         Ok(Box::new(NamespacedIterator { iter, namespace }))
     }
 
+    pub async fn collection_head_entries(
+        &self,
+        namespace: Namespace,
+        head_prefix: &[u8],
+        marker_prefix: &[u8],
+    ) -> Result<Option<storage::stores::headstore::CollectionHeadEntries>> {
+        let mut entries = self
+            .txn
+            .read()
+            .await
+            .collection_head_entries(
+                &prefix_key(namespace, head_prefix),
+                &prefix_key(namespace, marker_prefix),
+            )
+            .await?;
+        if let Some(entries) = &mut entries {
+            for row in entries.heads.iter_mut().chain(&mut entries.markers) {
+                row.key = unprefix_key(namespace, &row.key)?;
+            }
+        }
+        Ok(entries)
+    }
+
     /// Get from rootstore (no namespace prefix).
     pub async fn root_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         let txn = self.txn.read().await;
@@ -208,6 +231,16 @@ impl Reader for NamespaceView {
 
     async fn iterator(&self, opts: IterOptions) -> Result<Box<dyn Iterator>> {
         self.txn.iterator(self.namespace, opts).await
+    }
+
+    async fn collection_head_entries(
+        &self,
+        head_prefix: &[u8],
+        marker_prefix: &[u8],
+    ) -> Result<Option<storage::stores::headstore::CollectionHeadEntries>> {
+        self.txn
+            .collection_head_entries(self.namespace, head_prefix, marker_prefix)
+            .await
     }
 }
 
