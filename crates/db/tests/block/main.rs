@@ -9,6 +9,7 @@ mod builder_write_encryption_tests;
 mod builder_write_kms_tests;
 mod builder_write_priority_tests;
 mod cleanup;
+mod head_cache_conformance;
 mod heads;
 mod priority;
 mod verify;
