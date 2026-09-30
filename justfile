@@ -628,8 +628,9 @@ lean:
 # real release binary and is serial because each test spins up real nodes.
 [doc("Model-to-code binding, Lean axis (fast, no binary needed).")]
 [group('proofs')]
-conformance:
+conformance: lean
     cargo test -p conformance --lib --test lean_conformance
+    cargo test -p db --test block head_cache_conformance::
 
 [doc("Model-to-code binding, TLA axis against the release binary.")]
 [group('proofs')]

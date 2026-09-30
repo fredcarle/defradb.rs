@@ -1,9 +1,9 @@
 //! A regolith-backed transaction.
 //!
-//! There is no lock here and no pending-write buffer of our own.
-//! regolith's transaction is shareable, buffers its own writes, tracks
-//! its own read set, and validates at commit, so this type is the corekv
-//! surface over it plus the callback bookkeeping DefraDB expects.
+//! regolith owns the write buffer, read set, and commit validation. A bounded
+//! head-key journal updates the optional collection-head projection only after
+//! native commit succeeds. Snapshot capture and publication share a short lock;
+//! the application transaction never holds that lock across its lifetime.
 //!
 //! A read-only transaction does not begin one at all: it pins a snapshot,
 //! which is the same view without the commit-time validation nothing will
@@ -17,6 +17,7 @@ use bytes::Bytes;
 use regolith::{IsolationLevel, OptimisticTransactionDb, OwnedTransaction, TransactionError};
 
 use super::handle::Handle;
+use super::head_cache::{self, HeadChanges, HeadSnapshot, SharedHeadCache};
 use super::iterator::RegolithIterator;
 use crate::backends::shared::{CallbackManager, TransactionStatsHandle};
 use crate::corekv::{
@@ -30,6 +31,9 @@ pub struct RegolithTxn {
     stats: TransactionStatsHandle,
     callbacks: CallbackManager,
     readonly: bool,
+    pub(super) head_cache: SharedHeadCache,
+    head_snapshot: Option<HeadSnapshot>,
+    head_changes: HeadChanges,
 }
 
 impl RegolithTxn {
@@ -39,19 +43,28 @@ impl RegolithTxn {
         isolation: IsolationLevel,
         active_txns: Arc<AtomicUsize>,
         stats: TransactionStatsHandle,
-    ) -> Self {
+        head_cache: SharedHeadCache,
+    ) -> Result<Self> {
+        let cache = head_cache::lock(&head_cache)?;
         let handle = if readonly {
             Handle::ReadOnly(db.db().snapshot())
         } else {
             Handle::Writable(Box::new(db.begin_transaction_owned(isolation)))
         };
-        Self {
+        let head_snapshot = (!cache.disabled
+            && (readonly || isolation == IsolationLevel::RepeatableRead))
+            .then(|| cache.capture(db.db().snapshot()));
+        drop(cache);
+        Ok(Self {
             handle: Some(Arc::new(handle)),
             active_txns,
             stats,
             callbacks: CallbackManager::default(),
             readonly,
-        }
+            head_cache,
+            head_snapshot,
+            head_changes: HeadChanges::default(),
+        })
     }
 
     fn handle(&self) -> Result<&Arc<Handle>> {
@@ -172,6 +185,21 @@ impl Reader for RegolithTxn {
         }
     }
 
+    async fn collection_head_entries(
+        &self,
+        head_prefix: &[u8],
+        marker_prefix: &[u8],
+    ) -> Result<Option<crate::stores::headstore::CollectionHeadEntries>> {
+        self.handle()?;
+        let Some(collection_id) = head_cache::matching_collection(head_prefix, marker_prefix)
+        else {
+            return Ok(None);
+        };
+        self.head_snapshot.as_ref().map_or(Ok(None), |snapshot| {
+            snapshot.read(&self.head_cache, &self.head_changes, collection_id)
+        })
+    }
+
     async fn iterator(&self, opts: IterOptions) -> Result<Box<dyn Iterator>> {
         // The iterator holds the same handle, so it keeps the snapshot or
         // the transaction alive without borrowing this one. Scanning a
@@ -191,14 +219,18 @@ impl Writer for RegolithTxn {
         if key.is_empty() {
             return Err(Error::EmptyKey);
         }
-        self.writable()?.put(key, value).map_err(map_txn_error)
+        self.writable()?.put(key, value).map_err(map_txn_error)?;
+        self.head_changes.record(key, Some(value));
+        Ok(())
     }
 
     async fn delete(&mut self, key: &[u8]) -> Result<()> {
         if key.is_empty() {
             return Err(Error::EmptyKey);
         }
-        self.writable()?.delete(key).map_err(map_txn_error)
+        self.writable()?.delete(key).map_err(map_txn_error)?;
+        self.head_changes.record(key, None);
+        Ok(())
     }
 }
 
@@ -218,11 +250,20 @@ impl Txn for RegolithTxn {
                     .to_string(),
             )
         })?;
-        let outcome = match handle {
-            // Nothing was written, so there is nothing to validate and
-            // nothing to apply.
-            Handle::ReadOnly(_) => Ok(()),
-            Handle::Writable(txn) => txn.commit().map_err(map_txn_error),
+        // Native commit and cache publication are one boundary. Never run
+        // user callbacks under it, and never publish a failed transaction.
+        let outcome = {
+            let mut cache = head_cache::lock(&self.head_cache)?;
+            let outcome = match handle {
+                // Nothing was written, so there is nothing to validate and
+                // nothing to apply.
+                Handle::ReadOnly(_) => Ok(()),
+                Handle::Writable(txn) => txn.commit().map_err(map_txn_error),
+            };
+            if outcome.is_ok() {
+                cache.publish(&self.head_changes);
+            }
+            outcome
         };
         match outcome {
             Ok(()) => {

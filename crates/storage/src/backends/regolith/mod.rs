@@ -2,6 +2,7 @@
 
 mod config;
 mod handle;
+mod head_cache;
 pub(crate) mod iterator;
 mod store;
 mod transaction;

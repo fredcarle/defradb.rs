@@ -579,15 +579,23 @@ impl<S: Store> DB<S> {
         {
             return;
         }
-        if let Err(error) = self.prune_collection_heads(collection_short_id).await {
+        match self.prune_collection_heads(collection_short_id).await {
+            Ok(_) => {}
             // Reclamation is the one path here that can lose a write race, and
             // losing costs nothing: the head set is a function of the markers,
             // so the next pass repeats the work.
-            tracing::debug!(
+            Err(error) if error.is_txn_conflict() => tracing::debug!(
                 collection_short_id,
                 %error,
-                "collection head reclamation did not complete"
-            );
+                "collection head reclamation lost a write race"
+            ),
+            // Any other failure repeats on every pass, and every branchable
+            // append then scans a head set that only grows.
+            Err(error) => tracing::warn!(
+                collection_short_id,
+                %error,
+                "collection head reclamation failed"
+            ),
         }
     }
 
@@ -602,14 +610,18 @@ impl<S: Store> DB<S> {
         collection_short_id: u32,
     ) -> Result<crate::block::heads::PruneOutcome> {
         let txn = self.new_txn(false).await?;
-        let headstore = txn.headstore()?;
-        let outcome = crate::block::heads::prune_superseded_heads(
-            &headstore,
-            collection_short_id,
-            HEAD_PRUNE_MAX_KEYS,
-        )
-        .await
-        .map_err(Error::Storage)?;
+        let outcome = {
+            // A live view keeps the transaction referenced, and commit refuses
+            // a referenced transaction.
+            let headstore = txn.headstore()?;
+            crate::block::heads::prune_superseded_heads(
+                &headstore,
+                collection_short_id,
+                HEAD_PRUNE_MAX_KEYS,
+            )
+            .await
+            .map_err(Error::Storage)?
+        };
         if outcome == crate::block::heads::PruneOutcome::default() {
             txn.discard()?;
             return Ok(outcome);
