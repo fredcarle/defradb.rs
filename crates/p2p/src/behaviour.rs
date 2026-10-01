@@ -105,7 +105,14 @@ pub struct DefraBehaviour<S: Store> {
     pub pushlog: request_response::Behaviour<PushLogCodec>,
 
     /// GossipSub for pubsub messaging (optional, controlled by `pubsub_enabled` config).
-    pub gossipsub: Toggle<gossipsub::Behaviour>,
+    ///
+    /// Every document is its own topic, so peers routinely hold more than
+    /// gossipsub's default cap of 100 subscriptions; past it, a peer's whole
+    /// subscription RPC is dropped. go-libp2p-pubsub has no cap, so neither
+    /// do we.
+    pub gossipsub: Toggle<
+        gossipsub::Behaviour<gossipsub::IdentityTransform, gossipsub::AllowAllSubscriptionFilter>,
+    >,
 
     /// Relay client for circuit relay (optional, controlled by `relay_enabled` config).
     /// Initialized as disabled; the SwarmBuilder injects the client when relay is enabled.
@@ -272,9 +279,12 @@ impl<S: Store + Clone + Send + Sync + 'static> DefraBehaviour<S> {
                 .build()
                 .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
 
-            let gs =
-                gossipsub::Behaviour::new(MessageAuthenticity::Signed(keypair), gossipsub_config)
-                    .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
+            let gs = gossipsub::Behaviour::new_with_subscription_filter(
+                MessageAuthenticity::Signed(keypair),
+                gossipsub_config,
+                gossipsub::AllowAllSubscriptionFilter {},
+            )
+            .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
             Toggle::from(Some(gs))
         } else {
             Toggle::from(None)
@@ -372,8 +382,12 @@ impl<S: Store + Clone + Send + Sync + 'static> DefraBehaviour<S> {
                 .build()
                 .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
 
-            let gs = gossipsub::Behaviour::new(MessageAuthenticity::RandomAuthor, gossipsub_config)
-                .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
+            let gs = gossipsub::Behaviour::new_with_subscription_filter(
+                MessageAuthenticity::RandomAuthor,
+                gossipsub_config,
+                gossipsub::AllowAllSubscriptionFilter {},
+            )
+            .map_err(|e| crate::error::Error::GossipSubConfig(e.to_string()))?;
             Toggle::from(Some(gs))
         } else {
             Toggle::from(None)

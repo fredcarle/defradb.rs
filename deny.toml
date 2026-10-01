@@ -49,12 +49,6 @@ ignore = [
     # component-model. Removable on wasmtime >= 48.0.3.
     "RUSTSEC-2026-0316",
 
-    # hickory-proto 0.25 — NSEC3 validation loop (DNSSEC, not enabled) and
-    # O(n²) name compression when dialing /dns multiaddrs. Pulled by
-    # libp2p-dns 0.44; removable with the libp2p 0.57 bump (#1875).
-    "RUSTSEC-2026-0118",
-    "RUSTSEC-2026-0119",
-
     # h2 0.3 and rustls-webpki 0.101 — pulled by reqwest 0.11 inside
     # tendermint-rpc 0.40.4 (vera's Cosmos client), already the latest
     # release. Reached only over TLS to the configured Cosmos RPC endpoint.
@@ -138,15 +132,13 @@ skip = [
     # hashing under docID/CID and still not remove 0.10.
     { crate = "sha2@0.11.0", reason = "multihash-codetable 0.2.2 needs 0.11 in the CID path; libp2p-identity 0.2.13 pins 0.10.8 — floor is 2" },
 
-    # ed25519-dalek / curve25519-dalek — iroh-base 1.0.1 uses exact
-    # pins (=3.0.0-rc.0, =5.0.0-rc.0) leaving no semver room, while
-    # libp2p-identity 0.2.13 requires ed25519-dalek 2.1. Unification is
-    # impossible in both directions; moving crates/crypto to the rc
-    # line would put Go-interop signing on a prerelease and still leave
-    # 2.2.0 in the graph. Absent from the default cli and ffi graphs
-    # (iroh is opt-in); dies with #1341.
-    { crate = "ed25519-dalek@3.0.0-rc.0", reason = "exact-pinned by iroh-base 1.0.1; libp2p-identity floor-pins 2.x — dies with #1341" },
-    { crate = "curve25519-dalek@5.0.0-rc.0", reason = "exact-pinned by iroh-base 1.0.1 — dies with #1341" },
+    # ed25519-dalek / curve25519-dalek — libp2p-identity 0.3, iroh-base
+    # and commonware-cryptography are on ed25519-dalek 3 / curve25519-dalek
+    # 5, while crates/crypto signs with ed25519-dalek 2 for Go interop and
+    # snow (noise) is on curve25519-dalek 4. Moving crates/crypto to 3.x
+    # needs a signing review against Go; snow keeps 4.x regardless.
+    { crate = "ed25519-dalek@3.0.0", reason = "libp2p-identity 0.3 and iroh-base; crates/crypto stays on 2.x for Go-interop signing" },
+    { crate = "curve25519-dalek@5.0.0", reason = "ed25519-dalek 3, x25519-dalek 3, commonware-cryptography; snow 0.10 holds 4.x" },
 
     # reqwest 0.11 — one edge: tendermint-rpc 0.40.4 under cosmrs 0.22.
     # It carries hyper 0.14, h2 0.3, rustls 0.21, tokio-rustls 0.24,
@@ -172,9 +164,6 @@ skip = [
     # unsigned-varint 0.2 — reached only through multicodec 0.1 under
     # defra-core. Removed for free by #1330.
     { crate = "unsigned-varint@0.2.3", reason = "multicodec 0.1 under defra-core — removed by #1330" },
-
-    # unsigned-varint 0.7 — multistream-select 0.13 inside libp2p.
-    { crate = "unsigned-varint@0.7.2", reason = "multistream-select 0.13 inside libp2p" },
 
     # sysinfo 0.37 — commonware-runtime, i.e. vera/backbone builds
     # only. crates/p2p was moved 0.29 -> 0.33 in #1333 to unify with

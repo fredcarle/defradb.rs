@@ -12,7 +12,6 @@
 use std::io;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::identity::Keypair;
 use libp2p::request_response;
@@ -150,7 +149,6 @@ impl PushLogCodec {
     }
 }
 
-#[async_trait]
 impl request_response::Codec for PushLogCodec {
     type Protocol = libp2p::StreamProtocol;
     type Request = PushLogRequest;
