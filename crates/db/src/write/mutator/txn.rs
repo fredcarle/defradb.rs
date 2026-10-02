@@ -16,8 +16,8 @@ use crate::collection::Collection;
 use crate::database::DB;
 use crate::event::emission::register_update_event_callback;
 use crate::txn::DbTxn;
-use crate::write::autocommit::helpers::write_branchable_collection_block;
 use crate::write::create::{create_documents, TxnStores};
+use crate::write::persist::write_branchable_collection_block;
 use defra_core::encryption::get_encryption_config;
 use defra_core::signing::get_signing_config;
 
@@ -325,7 +325,7 @@ impl<S: Store + 'static> DocMutator for DbDocMutator<S> {
             }
         }
 
-        crate::write::autocommit::helpers::write_local_update_deferred(
+        crate::write::persist::write_local_update_deferred(
             &datastore,
             &collection,
             &doc,
@@ -381,7 +381,7 @@ impl<S: Store + 'static> DocMutator for DbDocMutator<S> {
                 ))
             })?;
 
-            crate::write::autocommit::helpers::register_block_doc_id_mappings(
+            crate::write::persist::register_block_doc_id_mappings(
                 &systemstore,
                 &block_result,
                 &canonical_doc_id.to_string(),

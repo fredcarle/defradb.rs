@@ -12,10 +12,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use storage::corekv::Store;
 
-use super::helpers::{
-    ensure_collection_is_active, register_block_doc_id_mappings, write_branchable_collection_block,
-    write_local_update,
-};
 use crate::block::builder::DocStorageIdentity;
 use crate::block::builder::{write_delete_block, write_document_blocks};
 use crate::collection::loader::{get_collection_with_index_manager, get_collection_with_lazy_load};
@@ -23,6 +19,10 @@ use crate::database::DB;
 use crate::event::emission::register_update_event_callback;
 use crate::txn::DbTxn;
 use crate::write::create::{create_documents, TxnStores};
+use crate::write::persist::{
+    ensure_collection_is_active, register_block_doc_id_mappings, write_branchable_collection_block,
+    write_local_update,
+};
 use defra_core::encryption::get_encryption_config;
 use defra_core::signing::get_signing_config;
 

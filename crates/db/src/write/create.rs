@@ -15,7 +15,7 @@ use crate::collection::Collection;
 use crate::database::DB;
 use crate::index::IndexManager;
 use crate::txn::DbTxn;
-use crate::write::autocommit::helpers::{
+use crate::write::persist::{
     register_created_doc, write_branchable_collection_block, write_local_create,
 };
 use defra_core::encryption::get_encryption_config;

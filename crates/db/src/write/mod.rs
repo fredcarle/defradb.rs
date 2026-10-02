@@ -1,5 +1,6 @@
 //! The write path: the mutators that produce document deltas.
-pub mod autocommit;
+pub(crate) mod counter;
 pub(crate) mod create;
-pub mod doc;
+pub mod mutator;
+pub(crate) mod persist;
 pub mod queue;
