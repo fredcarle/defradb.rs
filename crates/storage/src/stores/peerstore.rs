@@ -34,29 +34,32 @@ fn legacy_retry_commit_key(peer_id: &str, collection_id: &str, cid: &str) -> Vec
 }
 
 type RetryPeerLock = RwLock<()>;
+type RetryPeerLocks = HopscotchMap<String, Weak<RetryPeerLock>, RandomState>;
 
 fn retry_peer_lock(peer_id: &str) -> Arc<RetryPeerLock> {
-    static LOCKS: OnceLock<HopscotchMap<String, Weak<RetryPeerLock>, RandomState>> =
-        OnceLock::new();
+    static LOCKS: OnceLock<RetryPeerLocks> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| HopscotchMap::with_hasher(RandomState::default()));
+    retry_peer_lock_from(locks, peer_id)
+}
 
+fn retry_peer_lock_from(locks: &RetryPeerLocks, peer_id: &str) -> Arc<RetryPeerLock> {
     loop {
         if let Some(lock) = locks.get(peer_id).and_then(|weak| weak.upgrade()) {
             return lock;
         }
         let candidate = Arc::new(RetryPeerLock::new(()));
-        // get_or_insert is the atomic decision point: concurrent callers racing
-        // on an absent key all receive the same freshly inserted Weak.
         let weak = locks.get_or_insert(peer_id.to_string(), Arc::downgrade(&candidate));
         if let Some(lock) = weak.upgrade() {
             return lock;
         }
-        // vertexia: no table-wide sweep of dead entries for other peers
-        // (HopscotchMap has no retain); each peer's entry self-heals lazily on
-        // its next lookup instead. If per-peer churn grows unbounded, revisit
-        // with a periodic sweep over locks.iter().
-        locks.remove(peer_id);
+        remove_expired_retry_peer_lock(locks, peer_id);
     }
+}
+
+fn remove_expired_retry_peer_lock(locks: &RetryPeerLocks, peer_id: &str) {
+    // Check the current entry atomically: a stale caller must not remove a
+    // live replacement. A Weak with no strong owners cannot become live again.
+    locks.remove_if(peer_id, |weak| weak.strong_count() == 0);
 }
 
 /// Keeps a retry pass or failure-recording operation coordinated with forget.
