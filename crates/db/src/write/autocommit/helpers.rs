@@ -119,23 +119,6 @@ pub(crate) async fn write_local_update_deferred(
         })
 }
 
-/// Persist a local CREATE WITHOUT seeding the counter store (#1044 interactive
-/// path). The blob is written; the counter store is seeded at the commit-time
-/// finalize. Used only by the interactive `DbDocMutator`.
-pub(crate) async fn write_local_create_deferred(
-    datastore: &NamespaceView,
-    collection: &Collection,
-    doc: &Document,
-    doc_short_id: u64,
-    index_manager: &IndexManager,
-) -> query::error::Result<()> {
-    collection
-        .create_with_indexes(datastore, doc, doc_short_id, index_manager)
-        .await
-        .map_err(|e| crate::error::index_write_query_error("create", e))?;
-    Ok(())
-}
-
 /// Register the identity of a freshly created document (Go `save()` isAdd):
 /// duplicate-check the derived DocID against the mapping, persist the
 /// short-ID <-> DocID mapping, and record block ownership for the genesis
@@ -205,11 +188,10 @@ pub(crate) async fn register_block_doc_id_mappings(
     Ok(())
 }
 
-/// Apply a SINGLE recorded counter delta (or create-seed) to the authoritative
-/// accumulation store at the commit-time finalize (#1044). For updates this is
-/// the delta-driven equivalent of `apply_local_counter_deltas` for one field;
-/// for creates it seeds the store like `init_counter_stores_on_create`. Returns
-/// the post-operation store value so the caller can mirror it into the blob.
+/// Apply a SINGLE recorded counter delta to the authoritative accumulation
+/// store at the commit-time finalize (#1044): the delta-driven equivalent of
+/// `apply_local_counter_deltas` for one field. Returns the post-operation store
+/// value so the caller can mirror it into the blob.
 ///
 /// The per-doc guard protecting this RMW is held by the caller (the finalize
 /// driver) and released only after the durable commit, preserving the #1021
@@ -223,7 +205,6 @@ pub(crate) async fn apply_pending_counter_op(
     field: &str,
     base: Option<&NormalValue>,
     delta: &NormalValue,
-    is_create: bool,
 ) -> query::error::Result<Option<NormalValue>> {
     let Some(field_desc) = collection.schema().fields.iter().find(|f| f.name == field) else {
         return Ok(None);
@@ -248,40 +229,7 @@ pub(crate) async fn apply_pending_counter_op(
 
     let mut rw = datastore.clone();
 
-    if is_create {
-        // Seed the store directly to the created (absolute) value, init-if-absent.
-        match (kind, delta) {
-            (NumericKind::Int64, NormalValue::Int(v)) => counter
-                .reconcile_int64(&mut rw, *v)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            (NumericKind::Float64, NormalValue::Float64(v)) => counter
-                .reconcile_float64(&mut rw, *v)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            (NumericKind::Float32, NormalValue::Float32(v)) => counter
-                .reconcile_float32(&mut rw, *v)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            (NumericKind::Float32, NormalValue::Float64(v)) => counter
-                .reconcile_float32(&mut rw, *v as f32)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            (NumericKind::Float32, NormalValue::Int(v)) => counter
-                .reconcile_float32(&mut rw, *v as f32)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            (NumericKind::Float64, NormalValue::Int(v)) => counter
-                .reconcile_float64(&mut rw, *v as f64)
-                .await
-                .map_err(|e| query::error::QueryError::execution(e.to_string()))?,
-            _ => {}
-        }
-        // On create the blob already equals the seeded value — no correction.
-        return Ok(None);
-    }
-
-    // UPDATE: init-if-absent from the PRE-WRITE committed value captured at record
+    // Init-if-absent from the PRE-WRITE committed value captured at record
     // time (`base`), then apply the recorded delta. We deliberately do NOT re-read
     // the committed doc here: the deferred update already overwrote the blob with
     // the query-plan's provisional (base+delta) value, so re-reading it as the

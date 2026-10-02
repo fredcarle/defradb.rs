@@ -180,7 +180,10 @@ impl<S: Store + 'static> DocMutator for AutoCommitMutator<S> {
         collection_name: &str,
         doc: Document,
     ) -> query::error::Result<CreateResult> {
-        self.create_impl(collection_name, doc).await
+        let mut created = self.create_many_impl(collection_name, vec![doc]).await?;
+        created
+            .pop()
+            .ok_or_else(|| query::error::QueryError::execution("create produced no document"))
     }
 
     async fn create_many(
