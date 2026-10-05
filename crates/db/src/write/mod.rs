@@ -4,3 +4,4 @@ pub(crate) mod create;
 pub mod mutator;
 pub(crate) mod persist;
 pub mod queue;
+pub(crate) mod update;

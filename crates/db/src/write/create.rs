@@ -8,8 +8,8 @@ use query::error::{QueryError, Result};
 use storage::corekv::Store;
 
 use crate::block::builder::{
-    compute_document_blocks, insert_computed_blocks, resolve_document_keys, ComputedBlocks,
-    DocStorageIdentity, DocumentKeys,
+    compute_document_blocks, insert_computed_blocks, plan_document_blocks, BlockPlan,
+    ComputedBlocks, DocStorageIdentity,
 };
 use crate::collection::Collection;
 use crate::database::DB;
@@ -101,10 +101,18 @@ pub(crate) async fn create_documents<S: Store + 'static>(
 
         let doc_short_id = db.next_doc_short_id().await.map_err(store_error)?;
         let identity = DocStorageIdentity::new(collection.resolved_root_id(), doc_short_id);
-        let keys = resolve_document_keys(&doc, identity, enc_config.as_ref(), kms.as_ref())
-            .await
-            .map_err(|e| block_error(collection_name, e))?;
-        prepared.push((doc, identity, keys));
+        let plan = plan_document_blocks(
+            blockstore,
+            headstore,
+            &doc,
+            identity,
+            None,
+            enc_config.as_ref(),
+            kms.as_ref(),
+        )
+        .await
+        .map_err(|e| block_error(collection_name, e))?;
+        prepared.push((doc, identity, plan));
     }
 
     let computed = compute_all(&prepared, schema_version_id, sign_config.as_ref())
@@ -148,12 +156,6 @@ pub(crate) async fn create_documents<S: Store + 'static>(
         )
         .await?;
 
-        if let Some(session_key) = defra_core::batch_signing::get_batch_session_key() {
-            for cid in result.field_cids.iter().chain([&result.cid]) {
-                defra_core::batch_signing::batch_collect_cid(&session_key, *cid);
-            }
-        }
-
         created.push(CreatedDoc {
             doc_id,
             doc,
@@ -175,14 +177,14 @@ fn block_error(collection_name: &str, error: String) -> QueryError {
 /// Compute every document's blocks, in parallel when there is more than one
 /// and the runtime can spare blocking threads.
 async fn compute_all(
-    prepared: &[(Document, DocStorageIdentity, DocumentKeys)],
+    prepared: &[(Document, DocStorageIdentity, BlockPlan)],
     schema_version_id: &str,
     sign_config: Option<&SigningConfig>,
 ) -> std::result::Result<Vec<ComputedBlocks>, String> {
     #[cfg(feature = "native")]
     if prepared.len() > 1 {
-        let tasks = prepared.iter().map(|(doc, identity, keys)| {
-            let (doc, identity, keys) = (doc.clone(), *identity, keys.clone());
+        let tasks = prepared.iter().map(|(doc, identity, plan)| {
+            let (doc, identity, plan) = (doc.clone(), *identity, plan.clone());
             let schema_version_id = schema_version_id.to_string();
             let sign_config = sign_config.cloned();
             tokio::task::spawn_blocking(move || {
@@ -190,7 +192,7 @@ async fn compute_all(
                     &doc,
                     &schema_version_id,
                     identity,
-                    &keys,
+                    &plan,
                     sign_config.as_ref(),
                 )
             })
@@ -204,8 +206,8 @@ async fn compute_all(
 
     prepared
         .iter()
-        .map(|(doc, identity, keys)| {
-            compute_document_blocks(doc, schema_version_id, *identity, keys, sign_config)
+        .map(|(doc, identity, plan)| {
+            compute_document_blocks(doc, schema_version_id, *identity, plan, sign_config)
         })
         .collect()
 }

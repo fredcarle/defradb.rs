@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock};
 use storage::corekv::Store;
 use tracing::warn;
 
-use crate::block::builder::{write_delete_block, write_document_blocks};
+use crate::block::builder::write_delete_block;
 use crate::collection::Collection;
 use crate::database::DB;
 use crate::index::IndexManager;
@@ -30,7 +30,6 @@ use crate::txn::DbTxn;
 /// Captured per-mutation commit data: the document block (cid + bytes) plus,
 /// for branchable collections, the collection block (cid + bytes).
 pub(super) type CommitArtifacts = (Cid, Bytes, Option<(Cid, Bytes)>);
-use defra_core::encryption::get_encryption_config;
 use defra_core::signing::get_signing_config;
 
 use crate::write::mutator::batch::BatchMutator;

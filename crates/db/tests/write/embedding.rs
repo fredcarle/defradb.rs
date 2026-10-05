@@ -10,10 +10,9 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use storage::RegolithStore;
 
-const STUB_VECTOR: [f64; 3] = [0.25, 0.5, 0.75];
-
-/// Serve an OpenAI-compatible `/embeddings` endpoint that always answers
-/// `STUB_VECTOR`, so embedding generation runs without a real provider.
+/// Serve an OpenAI-compatible `/embeddings` endpoint, so embedding generation
+/// runs without a real provider. The vector's first component is the request
+/// body's length, so different source text yields a different embedding.
 fn spawn_embedding_stub() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
     let addr = listener.local_addr().expect("stub addr");
@@ -31,7 +30,8 @@ fn spawn_embedding_stub() -> String {
                     break;
                 }
             }
-            let body = serde_json::json!({ "data": [{ "embedding": STUB_VECTOR }] }).to_string();
+            let embedding = stub_vector(request.len());
+            let body = serde_json::json!({ "data": [{ "embedding": embedding }] }).to_string();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -41,6 +41,10 @@ fn spawn_embedding_stub() -> String {
         }
     });
     format!("http://{addr}")
+}
+
+fn stub_vector(request_len: usize) -> [f64; 3] {
+    [request_len as f64, 0.5, 0.75]
 }
 
 fn request_complete(request: &[u8]) -> bool {
@@ -110,10 +114,10 @@ async fn autocommit_create_generates_embedding() {
     let doc = Document::from_json_str(r#"{"content": "hello"}"#).expect("doc");
     let created = mutator.create("Notes", doc).await.expect("create");
 
-    assert_eq!(
+    assert!(matches!(
         committed_embedding(&db, &created.doc_id).await,
-        Some(NormalValue::Float64Array(STUB_VECTOR.to_vec()))
-    );
+        Some(NormalValue::Float64Array(v)) if v.len() == 3
+    ));
 }
 
 #[tokio::test]
@@ -133,8 +137,43 @@ async fn explicit_txn_create_generates_embedding() {
     drop(ctx);
     registry.commit(&handle).await.expect("commit");
 
-    assert_eq!(
+    assert!(matches!(
         committed_embedding(&db, &created.doc_id).await,
-        Some(NormalValue::Float64Array(STUB_VECTOR.to_vec()))
-    );
+        Some(NormalValue::Float64Array(v)) if v.len() == 3
+    ));
+}
+
+#[tokio::test]
+async fn explicit_txn_update_regenerates_embedding() {
+    let (db, _bus) = make_test_db_with_bus().await;
+    db.create_collection(embedded_collection(&spawn_embedding_stub()))
+        .await
+        .expect("schema");
+    let created = db::AutoCommitMutator::new(Arc::clone(&db))
+        .create(
+            "Notes",
+            Document::from_json_str(r#"{"content": "hello"}"#).expect("doc"),
+        )
+        .await
+        .expect("create");
+    let before = committed_embedding(&db, &created.doc_id).await;
+
+    let registry = DbTransactionRegistry::new(Arc::clone(&db));
+    let handle = registry.begin(false).await.expect("begin");
+    let ctx = registry.get(&handle).into_result().unwrap().unwrap();
+    let mutator = ctx.doc_mutator().expect("mutator");
+    let mut doc =
+        Document::from_json_str(r#"{"content": "a much longer piece of text"}"#).expect("doc");
+    doc.set_id(created.doc_id.clone());
+    mutator
+        .update("Notes", doc, ["content".to_string()].into_iter().collect())
+        .await
+        .expect("update");
+    drop(mutator);
+    drop(ctx);
+    registry.commit(&handle).await.expect("commit");
+
+    let after = committed_embedding(&db, &created.doc_id).await;
+    assert!(matches!(&after, Some(NormalValue::Float64Array(_))));
+    assert_ne!(after, before, "the update must regenerate the embedding");
 }
