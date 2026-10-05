@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::event::arrivals::sequence_on_commit;
 use crate::write::create::{create_documents, TxnStores};
 
 impl<S: Store + 'static> AutoCommitMutator<S> {
@@ -33,12 +34,9 @@ impl<S: Store + 'static> AutoCommitMutator<S> {
         // No per-doc write guard for creates: the DocID is derived from the
         // genesis block inside the txn, so no identity exists to guard yet.
         // The DocID-mapping duplicate check is the gate.
-        let _arrival_guard = self
-            .db
-            .doc_write_queue()
-            .acquire_arrival(collection.collection_id())
-            .await;
-        let txn = self.new_mutation_txn().await?;
+        let mut txn = self.new_mutation_txn().await?;
+        sequence_on_commit(&mut txn, &self.db, collection.resolved_root_id())
+            .map_err(|e| query::error::QueryError::execution(e.to_string()))?;
         let result = match TxnStores::of(&txn) {
             Ok(stores) => {
                 create_documents(

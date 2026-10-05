@@ -164,9 +164,14 @@ pub(crate) async fn register_created_doc(
     .map_err(|e| query::error::QueryError::execution(e.to_string()))?;
 
     register_block_doc_id_mappings(systemstore, block_result, doc_id_str).await?;
-    crate::event::arrivals::record(systemstore, collection.resolved_root_id(), doc_id_str)
-        .await
-        .map_err(|e| query::error::QueryError::execution(e.to_string()))?;
+    crate::event::arrivals::record(
+        systemstore,
+        collection.resolved_root_id(),
+        doc_short_id,
+        doc_id_str,
+    )
+    .await
+    .map_err(|e| query::error::QueryError::execution(e.to_string()))?;
 
     DocID::from_string(doc_id_str)
         .map_err(|e| query::error::QueryError::execution(format!("invalid derived DocID: {}", e)))

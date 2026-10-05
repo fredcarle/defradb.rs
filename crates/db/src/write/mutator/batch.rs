@@ -16,6 +16,7 @@ use crate::block::builder::DocStorageIdentity;
 use crate::block::builder::{write_delete_block, write_document_blocks};
 use crate::collection::loader::{get_collection_with_index_manager, get_collection_with_lazy_load};
 use crate::database::DB;
+use crate::event::arrivals::sequence_on_commit;
 use crate::event::emission::register_update_event_callback;
 use crate::txn::DbTxn;
 use crate::write::create::{create_documents, TxnStores};
@@ -194,12 +195,14 @@ impl<S: Store + 'static> DocMutator for BatchMutator<S> {
         // No per-doc write guard for creates: the DocID is derived from the
         // genesis block inside the txn; the mapping duplicate check is the gate.
         let stores = {
-            let txn_guard = self.txn.lock().await;
-            let txn = txn_guard.as_ref().ok_or_else(|| {
+            let mut txn_guard = self.txn.lock().await;
+            let txn = txn_guard.as_mut().ok_or_else(|| {
                 query::error::QueryError::execution(
                     "mutation batch transaction is no longer active",
                 )
             })?;
+            sequence_on_commit(txn, &self.db, collection.resolved_root_id())
+                .map_err(|e| query::error::QueryError::execution(e.to_string()))?;
             TxnStores::of(txn)?
         };
         let created = create_documents(
