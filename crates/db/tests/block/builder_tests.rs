@@ -156,6 +156,37 @@ async fn test_compute_document_blocks_places_encryption_metadata_in_blockstore_e
     );
 }
 
+#[tokio::test]
+async fn test_update_keeps_doc_id_without_composite_heads() {
+    let mut doc = Document::new();
+    doc.set("name", NormalValue::String("Erin".to_string()));
+    let created = build_blocks_from_document(&doc, "schema-v1", &make_test_blockstore())
+        .await
+        .unwrap();
+    doc.set_id(document::DocID::from_string(&created.doc_id).unwrap());
+    doc.set("name", NormalValue::String("Erin B".to_string()));
+
+    let db = db::DB::new(RegolithStore::in_memory().unwrap()).unwrap();
+    let txn = db.new_txn(true).await.unwrap();
+    let identity = DocStorageIdentity::new(1, 1);
+    let modified: rapidhash::RapidHashSet<String> = ["name".to_string()].into_iter().collect();
+    let plan = plan_document_blocks(
+        &txn.blockstore().unwrap(),
+        &txn.headstore().unwrap(),
+        &doc,
+        identity,
+        Some(&modified),
+        None,
+        None,
+    )
+    .await
+    .expect("plan should resolve");
+    let computed = compute_document_blocks(&doc, "schema-v1", identity, &plan, None)
+        .expect("blocks should compute");
+
+    assert_eq!(computed.block_result.doc_id, created.doc_id);
+}
+
 struct LocalSecp256r1Signer {
     private_key: crypto::Secp256r1PrivateKey,
 }

@@ -23,9 +23,8 @@ pub struct ComputedBlocks {
 /// optional sign -> serialize -> CID. Then the composite block the same way.
 /// Everything that needs storage or a KMS is resolved beforehand
 /// ([`plan_document_blocks`](super::plan_document_blocks)), so no block exists
-/// anywhere until the whole document is known. A create (no composite heads)
-/// derives the public DocID from its genesis composite CID; an update keeps
-/// the document's.
+/// anywhere until the whole document is known. A create derives the public
+/// DocID from its genesis composite CID; an update keeps the document's.
 pub fn compute_document_blocks(
     doc: &Document,
     schema_version_id: &str,
@@ -166,7 +165,7 @@ pub fn compute_document_blocks(
     stale_heads.extend(composite.stale_heads.iter().cloned());
     batch_signed.push(composite_cid);
 
-    let doc_id = if composite.heads.is_empty() {
+    let doc_id = if plan.is_create {
         derive_doc_id(&composite_cid)
     } else {
         doc.id()

@@ -46,6 +46,9 @@ pub struct BlockPlan {
     pub fields: RapidHashMap<String, FieldPlan>,
     pub composite: DagPosition,
     pub composite_key: Option<KeyLink>,
+    /// A create derives its DocID from the genesis composite; an update keeps
+    /// the document's.
+    pub is_create: bool,
 }
 
 /// Plan the blocks for writing `doc`. `modified_fields` is `None` for a create,
@@ -149,6 +152,7 @@ pub async fn plan_document_blocks(
         fields,
         composite,
         composite_key,
+        is_create: modified_fields.is_none(),
     })
 }
 
