@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use regolith::{OptimisticTransactionDb, StreamOptions};
 
+use super::background_errors::BackgroundErrorListener;
 use super::config::RegolithStoreOptions;
 use super::head_cache::{self, SharedHeadCache};
 use super::transaction::RegolithTxn;
@@ -67,7 +68,11 @@ impl RegolithStore {
                 })?;
             }
         }
-        let db = OptimisticTransactionDb::open(&path, options.engine.clone())
+        let mut engine = options.engine.clone();
+        engine
+            .listeners
+            .push(Arc::new(BackgroundErrorListener) as Arc<dyn regolith::EventListener>);
+        let db = OptimisticTransactionDb::open(&path, engine)
             .map_err(|error| Error::Backend(format!("failed to open regolith: {error}")))?
             .with_isolation(options.isolation);
         Ok(Self {
