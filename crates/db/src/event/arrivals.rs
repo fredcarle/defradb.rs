@@ -64,8 +64,14 @@ pub(crate) async fn record(
 /// follows under the guard and numbers them.
 pub(crate) async fn sequence<S: Store>(db: &DB<S>, collection: u32) {
     let _guard = db.doc_write_queue().acquire_arrival(collection).await;
-    if let Err(error) = try_sequence(db, collection).await {
-        tracing::debug!(collection, %error, "arrival sequencing left to the next run");
+    match try_sequence(db, collection).await {
+        Ok(()) => {}
+        Err(error) if error.is_txn_conflict() => {
+            tracing::debug!(collection, %error, "arrival sequencing left to the next run")
+        }
+        // Anything else repeats on every run, leaving arrivals pending until
+        // the database reopens.
+        Err(error) => tracing::warn!(collection, %error, "arrival sequencing failed"),
     }
 }
 
