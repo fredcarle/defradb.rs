@@ -50,6 +50,18 @@ impl Collection {
                         field_def.name, field_def.kind, value
                     )));
                 }
+                Some(value)
+                    if field_def.size != 0
+                        && value
+                            .scalar_array_len()
+                            .is_some_and(|len| len != field_def.size) =>
+                {
+                    return Err(Error::InvalidDocument(format!(
+                        "array size mismatch. Actual: {}, Expected: {}",
+                        value.scalar_array_len().unwrap_or_default(),
+                        field_def.size
+                    )));
+                }
                 None if !field_def.kind.is_nillable() => {
                     return Err(Error::InvalidDocument(format!(
                         "value not provided for non-nillable field. Name: {}",
