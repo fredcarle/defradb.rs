@@ -65,3 +65,21 @@ async fn create_accepts_a_null_array() {
 
     mutator.create("Users", doc).await.expect("create");
 }
+
+#[tokio::test]
+async fn create_ignores_size_on_a_json_field() {
+    let (db, bus) = make_test_db_with_bus().await;
+    let sdl = r#"
+        type Users {
+            data: JSON @constraints(size: 2)
+        }
+    "#;
+    db.create_collections_atomic(query::parse_sdl(sdl).unwrap())
+        .await
+        .expect("schema");
+    let mutator = db::AutoCommitMutator::new(Arc::clone(&db));
+    let doc = Document::from_json_str(r#"{"data": [27, 28, 29]}"#).unwrap();
+
+    mutator.create("Users", doc).await.expect("create");
+    drop(bus);
+}

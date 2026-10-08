@@ -52,6 +52,9 @@ impl Collection {
                 }
                 Some(value)
                     if field_def.size != 0
+                        // Go only enforces `size` on scalar-array kinds; a JSON
+                        // (or other non-array) field may still hold an array.
+                        && matches!(field_def.kind, FieldKind::ScalarArray(_))
                         && value
                             .scalar_array_len()
                             .is_some_and(|len| len != field_def.size) =>
