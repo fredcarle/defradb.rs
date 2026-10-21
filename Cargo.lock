@@ -11174,7 +11174,7 @@ dependencies = [
  "rustls-webpki 0.103.16",
  "security-framework 3.7.0",
  "security-framework-sys",
- "webpki-root-certs 1.0.6",
+ "webpki-root-certs 1.0.10",
  "windows-sys 0.52.0",
 ]
 
